@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2025-08-24
+
+### Added
+- **Category Groups**: Organize categories into logical groups for better budget management
+  - `api.add_group()` - Create category groups with name, description, and sort order
+  - `api.get_groups()` - List all groups for a ledger ordered by sort order
+  - `api.assign_category_to_group()` - Assign categories to groups or make them ungrouped
+  - `api.delete_group()` - Delete group (categories become ungrouped, history preserved)
+- **Group-Filtered Reporting**: Enhanced budget analysis with group-based filtering
+  - `api.get_budget_totals()` now supports optional group filtering parameter
+  - Group-filtered budget status reporting for targeted analysis
+- **Database Schema Enhancements**:
+  - `data.groups` table with RLS policies and proper constraints
+  - `group_id` column added to `data.accounts` (categories) table
+  - Indexes for performance on group relationships and sort order
+
+### Enhanced
+- **Budget Organization**: Categories can now be organized into logical groups (Household, Transportation, etc.)
+- **Flexible Reporting**: Budget totals and status can be filtered by specific groups
+- **Data Integrity**: Group deletion preserves transaction history while orphaning categories
+- **User Experience**: Sort order support enables drag-and-drop UI implementations
+
+### Technical
+- **Migration Files**: 3 new migrations for complete category groups implementation
+  - `20250824214953_add_groups_table.sql` - Groups table with RLS and constraints
+  - `20250824220136_add_group_id_to_categories.sql` - Category-group relationships
+  - `20250824220411_add_group_api_functions.sql` - Complete API function suite
+- **Backward Compatibility**: All existing functionality preserved, groups are optional
+- **Test Coverage**: Comprehensive test suite including group management, deletion, and reassignment scenarios
+
 ## [0.3.0] - 2025-08-23
 
 ### Added
