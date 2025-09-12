@@ -1,0 +1,149 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+pgbudget is a PostgreSQL-based zero-sum budgeting database engine implementing double-entry accounting principles for personal finance applications. It provides a complete database foundation for budgeting apps similar to YNAB.
+
+## Development Commands
+
+### Database Migrations (using Goose)
+```bash
+# Run all pending migrations
+task migrate:up
+
+# Run one migration
+task migrate:up-one
+
+# Rollback last migration  
+task migrate:down
+
+# Drop all migrations
+task migrate:drop
+
+# Show migration status
+task migrate:status
+
+# Create new migration
+task migrate:new -- migration_name
+```
+
+### Testing
+```bash
+# Run all tests
+go test -v
+
+# Run specific test
+go test -v -run TestFunctionName
+```
+
+### Build and Run
+```bash
+# Build the project
+go build -o pgbudget
+
+# Run the main program
+go run main.go
+```
+
+## Architecture
+
+### Database Schema Design
+The database uses a three-schema architecture:
+
+- **`data`**: Raw tables with primary keys, constraints, and RLS policies
+- **`utils`**: Internal business logic functions (not exposed publicly)
+- **`api`**: Public interface functions accepting UUID parameters
+
+### Key Principles
+- **Zero-sum budgeting**: Every dollar of income is allocated to budget categories
+- **Double-entry accounting**: All transactions maintain the accounting equation (Assets = Liabilities + Equity)
+- **Multi-tenant**: Row Level Security (RLS) ensures users only see their own data
+- **UUID-based APIs**: Public functions use UUIDs while internal functions use bigint IDs
+
+### Account Types
+- **Assets**: Bank accounts, cash
+- **Liabilities**: Credit cards, loans  
+- **Equity**: Income (unallocated funds) and budget categories (allocated funds)
+
+## Development Conventions
+
+### PostgreSQL Code Style
+- Write SQL queries in lowercase
+- Add comments above each query step
+- Use `bigint generated always as identity` for primary keys
+- Define table constraints rather than column constraints
+- Follow naming: `<table>_<column>_<constraint>_<type>`
+
+### Function Organization
+- **API functions**: Accept UUIDs, provide user-friendly interface
+- **Utils functions**: Accept bigint IDs, handle internal logic
+- **Mutations**: Use api schema functions for safety and convenience
+- **Queries**: Direct access to data schema is acceptable
+
+### Testing
+- Uses testcontainers for PostgreSQL integration testing
+- Each test sets up isolated database state
+- Tests validate both API functions and direct SQL queries
+- Test user context with `set_config('app.current_user_id', 'user_id', false)`
+
+## Key Features
+
+### Core Functionality
+- Create ledgers (budgets) with automatic default accounts
+- Add asset/liability accounts and budget categories  
+- Record income and spending transactions
+- Assign money from income to budget categories
+- Real-time balance calculations and budget status reporting
+
+### Category Groups
+- Organize categories into logical groups (Household, Transportation, etc.)
+- Filter budget reports by category groups
+- Maintain category relationships when groups are deleted
+
+### Transaction Management
+- Correct existing transactions with audit trail
+- Delete transactions with proper accounting reversals
+- Complete transaction history with running balances
+
+## File Structure
+
+### Migrations (`/migrations/`)
+- Chronological SQL files managed by Goose
+- Each migration creates tables, functions, views, or triggers
+- Implements RLS policies and database constraints
+
+### Test Files
+- `main_test.go`: Comprehensive integration tests
+- `testutils/pgcontainer/`: PostgreSQL container setup utilities
+
+### Documentation
+- `README.md`: User-facing API documentation and examples
+- `ARCHITECTURE.md`: Detailed technical architecture
+- `CONVENTIONS.md`: Development coding standards
+- `SPEC.md`: Budgeting methodology and business rules
+
+## Testing Setup
+
+Set user context at the beginning of each test session:
+```sql
+SELECT set_config('app.current_user_id', 'test_user_123', false);
+```
+
+This ensures RLS policies work correctly and data is properly isolated between users.
+
+## Common Development Patterns
+
+### Creating API Functions
+1. Write utils function with bigint parameters for internal logic
+2. Create api function wrapper that accepts UUIDs and calls utils function
+3. Add proper error handling and input validation
+4. Include comprehensive tests for both happy path and edge cases
+
+### Adding New Tables
+1. Create migration with proper RLS policy
+2. Add utils functions for CRUD operations  
+3. Create api wrapper functions
+4. Update relevant views and triggers
+5. Add comprehensive test coverage

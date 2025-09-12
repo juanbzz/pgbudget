@@ -194,3 +194,5 @@ migrations_old
 # Crush directory
 .crush
 .crush.json
+
+nogit_docs
