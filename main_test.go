@@ -2243,6 +2243,353 @@ func TestDatabase(t *testing.T) {
 		},
 	)
 
+	// Test the api.get_budget_status function with month view functionality
+	t.Run(
+		"MonthViewBudgetStatus", func(t *testing.T) {
+			is := is_.New(t)
+
+			// Create a new ledger specifically for this test
+			var monthViewLedgerUUID string
+
+			err := conn.QueryRow(
+				ctx,
+				"INSERT INTO api.ledgers (name) VALUES ($1) RETURNING uuid",
+				"MonthView Test Ledger",
+			).Scan(&monthViewLedgerUUID)
+			is.NoErr(err)
+
+			// Create accounts and categories
+			var checkingAccountUUID, groceriesCategoryUUID, rentCategoryUUID string
+
+			err = conn.QueryRow(
+				ctx,
+				"INSERT INTO api.accounts (ledger_uuid, name, type) VALUES ($1, 'Checking', 'asset') RETURNING uuid",
+				monthViewLedgerUUID,
+			).Scan(&checkingAccountUUID)
+			is.NoErr(err)
+
+			err = conn.QueryRow(
+				ctx,
+				"INSERT INTO api.accounts (ledger_uuid, name, type) VALUES ($1, 'Groceries', 'equity') RETURNING uuid",
+				monthViewLedgerUUID,
+			).Scan(&groceriesCategoryUUID)
+			is.NoErr(err)
+
+			err = conn.QueryRow(
+				ctx,
+				"INSERT INTO api.accounts (ledger_uuid, name, type) VALUES ($1, 'Rent', 'equity') RETURNING uuid",
+				monthViewLedgerUUID,
+			).Scan(&rentCategoryUUID)
+			is.NoErr(err)
+
+			// Add some income to work with using the proper API function
+			// For inflow transactions, omitting category_uuid puts money in "Unassigned" 
+			_, err = conn.Exec(
+				ctx,
+				"SELECT api.add_transaction($1, '2025-08-01', 'Salary', 'inflow', 200000, $2)",
+				monthViewLedgerUUID, checkingAccountUUID,
+			)
+			is.NoErr(err)
+
+			// Assign money to categories in August 2025
+			_, err = conn.Exec(
+				ctx,
+				"SELECT api.assign_to_category($1, '2025-08-05', 'Groceries budget', 50000, $2)",
+				monthViewLedgerUUID, groceriesCategoryUUID,
+			)
+			is.NoErr(err)
+
+			_, err = conn.Exec(
+				ctx,
+				"SELECT api.assign_to_category($1, '2025-08-05', 'Rent budget', 120000, $2)",
+				monthViewLedgerUUID, rentCategoryUUID,
+			)
+			is.NoErr(err)
+
+			// Add spending transactions in August 2025
+			_, err = conn.Exec(
+				ctx,
+				"SELECT api.add_transaction($1, '2025-08-10', 'Grocery Store', 'outflow', 15000, $2, $3)",
+				monthViewLedgerUUID, checkingAccountUUID, groceriesCategoryUUID,
+			)
+			is.NoErr(err)
+
+			_, err = conn.Exec(
+				ctx,
+				"SELECT api.add_transaction($1, '2025-08-15', 'Monthly Rent', 'outflow', 120000, $2, $3)",
+				monthViewLedgerUUID, checkingAccountUUID, rentCategoryUUID,
+			)
+			is.NoErr(err)
+
+			// Add more transactions in September 2025 (different month)
+			_, err = conn.Exec(
+				ctx,
+				"SELECT api.assign_to_category($1, '2025-09-01', 'September groceries budget', 50000, $2)",
+				monthViewLedgerUUID, groceriesCategoryUUID,
+			)
+			is.NoErr(err)
+
+			_, err = conn.Exec(
+				ctx,
+				"SELECT api.add_transaction($1, '2025-09-05', 'September Groceries', 'outflow', 25000, $2, $3)",
+				monthViewLedgerUUID, checkingAccountUUID, groceriesCategoryUUID,
+			)
+			is.NoErr(err)
+
+			// Test 1: All-time budget status (no period parameter - backward compatibility)
+			t.Run("AllTimeBudgetStatus", func(t *testing.T) {
+				is := is_.New(t)
+
+				rows, err := conn.Query(
+					ctx,
+					"SELECT category_uuid, category_name, budgeted, activity, balance FROM api.get_budget_status($1)",
+					monthViewLedgerUUID,
+				)
+				is.NoErr(err)
+				defer rows.Close()
+
+				budgetStatus := make(map[string]struct {
+					Name     string
+					Budgeted int64
+					Activity int64
+					Balance  int64
+				})
+
+				for rows.Next() {
+					var uuid, name string
+					var budgeted, activity, balance int64
+
+					err = rows.Scan(&uuid, &name, &budgeted, &activity, &balance)
+					is.NoErr(err)
+
+					budgetStatus[name] = struct {
+						Name     string
+						Budgeted int64
+						Activity int64
+						Balance  int64
+					}{name, budgeted, activity, balance}
+				}
+
+				// All-time should include all budget assignments and spending
+				groceries := budgetStatus["Groceries"]
+				is.Equal(groceries.Budgeted, int64(100000)) // $50k Aug + $50k Sep = $100k total
+				is.Equal(groceries.Activity, int64(-40000)) // -$15k Aug - $25k Sep = -$40k total
+				is.Equal(groceries.Balance, int64(60000))   // $60k remaining overall
+
+				rent := budgetStatus["Rent"]
+				is.Equal(rent.Budgeted, int64(120000)) // $120k Aug only
+				is.Equal(rent.Activity, int64(-120000)) // -$120k Aug only
+				is.Equal(rent.Balance, int64(0))        // $0 remaining overall
+			})
+
+			// Test 2: August 2025 budget status (period-specific)
+			t.Run("AugustBudgetStatus", func(t *testing.T) {
+				is := is_.New(t)
+
+				rows, err := conn.Query(
+					ctx,
+					"SELECT category_uuid, category_name, budgeted, activity, balance FROM api.get_budget_status($1, $2)",
+					monthViewLedgerUUID, "202508",
+				)
+				is.NoErr(err)
+				defer rows.Close()
+
+				budgetStatus := make(map[string]struct {
+					Name     string
+					Budgeted int64
+					Activity int64
+					Balance  int64
+				})
+
+				for rows.Next() {
+					var uuid, name string
+					var budgeted, activity, balance int64
+
+					err = rows.Scan(&uuid, &name, &budgeted, &activity, &balance)
+					is.NoErr(err)
+
+					budgetStatus[name] = struct {
+						Name     string
+						Budgeted int64
+						Activity int64
+						Balance  int64
+					}{name, budgeted, activity, balance}
+				}
+
+				// August only should exclude September transactions
+				groceries := budgetStatus["Groceries"]
+				is.Equal(groceries.Budgeted, int64(50000)) // Only Aug budget: $50k
+				is.Equal(groceries.Activity, int64(-15000)) // Only Aug spending: -$15k
+				is.Equal(groceries.Balance, int64(35000))   // Aug period balance: $35k
+
+				rent := budgetStatus["Rent"]
+				is.Equal(rent.Budgeted, int64(120000)) // Aug budget: $120k
+				is.Equal(rent.Activity, int64(-120000)) // Aug spending: -$120k
+				is.Equal(rent.Balance, int64(0))        // Aug period balance: $0
+			})
+
+			// Test 3: September 2025 budget status
+			t.Run("SeptemberBudgetStatus", func(t *testing.T) {
+				is := is_.New(t)
+
+				rows, err := conn.Query(
+					ctx,
+					"SELECT category_uuid, category_name, budgeted, activity, balance FROM api.get_budget_status($1, $2)",
+					monthViewLedgerUUID, "202509",
+				)
+				is.NoErr(err)
+				defer rows.Close()
+
+				budgetStatus := make(map[string]struct {
+					Name     string
+					Budgeted int64
+					Activity int64
+					Balance  int64
+				})
+
+				for rows.Next() {
+					var uuid, name string
+					var budgeted, activity, balance int64
+
+					err = rows.Scan(&uuid, &name, &budgeted, &activity, &balance)
+					is.NoErr(err)
+
+					budgetStatus[name] = struct {
+						Name     string
+						Budgeted int64
+						Activity int64
+						Balance  int64
+					}{name, budgeted, activity, balance}
+				}
+
+				// September only
+				groceries := budgetStatus["Groceries"]
+				is.Equal(groceries.Budgeted, int64(50000)) // Only Sep budget: $50k
+				is.Equal(groceries.Activity, int64(-25000)) // Only Sep spending: -$25k
+				is.Equal(groceries.Balance, int64(25000))   // Sep period balance: $25k
+
+				rent := budgetStatus["Rent"]
+				is.Equal(rent.Budgeted, int64(0))  // No Sep budget
+				is.Equal(rent.Activity, int64(0))  // No Sep spending
+				is.Equal(rent.Balance, int64(0))   // Sep period balance: $0
+			})
+
+			// Test 4: Empty month (July 2025 - no transactions)
+			t.Run("EmptyMonthBudgetStatus", func(t *testing.T) {
+				is := is_.New(t)
+
+				rows, err := conn.Query(
+					ctx,
+					"SELECT category_uuid, category_name, budgeted, activity, balance FROM api.get_budget_status($1, $2)",
+					monthViewLedgerUUID, "202507",
+				)
+				is.NoErr(err)
+				defer rows.Close()
+
+				budgetStatus := make(map[string]struct {
+					Name     string
+					Budgeted int64
+					Activity int64
+					Balance  int64
+				})
+
+				for rows.Next() {
+					var uuid, name string
+					var budgeted, activity, balance int64
+
+					err = rows.Scan(&uuid, &name, &budgeted, &activity, &balance)
+					is.NoErr(err)
+
+					budgetStatus[name] = struct {
+						Name     string
+						Budgeted int64
+						Activity int64
+						Balance  int64
+					}{name, budgeted, activity, balance}
+				}
+
+				// July should have no activity for any categories
+				groceries := budgetStatus["Groceries"]
+				is.Equal(groceries.Budgeted, int64(0)) // No July budget
+				is.Equal(groceries.Activity, int64(0)) // No July spending
+				is.Equal(groceries.Balance, int64(0))  // No July balance
+
+				rent := budgetStatus["Rent"]
+				is.Equal(rent.Budgeted, int64(0)) // No July budget
+				is.Equal(rent.Activity, int64(0)) // No July spending
+				is.Equal(rent.Balance, int64(0))  // No July balance
+			})
+
+			// Test 5: Invalid period format error handling
+			t.Run("InvalidPeriodFormat", func(t *testing.T) {
+				is := is_.New(t)
+
+				// Test invalid period formats
+				invalidFormats := []string{
+					"2025",        // Too short
+					"20250813",    // Too long
+					"25082025",    // Wrong format
+					"abc123",      // Non-numeric
+					"202513",      // Invalid month
+					"",            // Empty string
+				}
+
+				for _, invalidPeriod := range invalidFormats {
+					var result struct {
+						UUID string
+						Name string
+						Budgeted int64
+						Activity int64
+						Balance int64
+					}
+
+					err := conn.QueryRow(
+						ctx,
+						"SELECT * FROM api.get_budget_status($1, $2) LIMIT 1",
+						monthViewLedgerUUID, invalidPeriod,
+					).Scan(&result.UUID, &result.Name, &result.Budgeted, &result.Activity, &result.Balance)
+
+					is.True(err != nil) // Should return error for invalid period format
+
+					var pgErr *pgconn.PgError
+					if errors.As(err, &pgErr) {
+						// Should be either our custom validation or PostgreSQL date validation
+						validError := strings.Contains(pgErr.Message, "Invalid period format") ||
+									 strings.Contains(pgErr.Message, "date/time field value out of range") ||
+									 strings.Contains(pgErr.Message, "invalid input syntax")
+						is.True(validError) // Should get an appropriate error for invalid period
+					}
+				}
+			})
+
+			// Test 6: Future month handling (should limit to current date)
+			t.Run("FutureMonthHandling", func(t *testing.T) {
+				is := is_.New(t)
+
+				// Test with future month - should work but limit to current date
+				rows, err := conn.Query(
+					ctx,
+					"SELECT category_uuid, category_name, budgeted, activity, balance FROM api.get_budget_status($1, $2)",
+					monthViewLedgerUUID, "202612", // December 2026 (future)
+				)
+				is.NoErr(err)
+				defer rows.Close()
+
+				// Should return data (not error) but with limited date range
+				var count int
+				for rows.Next() {
+					var uuid, name string
+					var budgeted, activity, balance int64
+					err = rows.Scan(&uuid, &name, &budgeted, &activity, &balance)
+					is.NoErr(err)
+					count++
+				}
+
+				is.True(count > 0) // Should still return categories
+			})
+		},
+	)
+
 	// Test the get_account_balance function
 	t.Run(
 		"GetAccountBalance", func(t *testing.T) {

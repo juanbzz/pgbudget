@@ -217,8 +217,14 @@ Example output:
 
 **Budget status for specific month:**
 ```sql
+-- August 2025 budget activity
 SELECT * FROM api.get_budget_status('d3pOOf6t', '202508');
+
+-- Current month budget activity
+SELECT * FROM api.get_budget_status('d3pOOf6t', TO_CHAR(CURRENT_DATE, 'YYYYMM'));
 ```
+
+The period parameter format is `YYYYMM` (e.g., `202508` for August 2025). When provided, the function shows only budget assignments and spending that occurred within that month.
 
 Example output:
 ```
