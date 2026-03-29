@@ -5057,3 +5057,134 @@ func TestRecordExpense(t *testing.T) {
 		is.True(err != nil)
 	})
 }
+
+func TestBudgetMoney(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "budget_money_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	// set up budget, account, categories, seed income
+	var budgetUUID string
+	err = conn.QueryRow(ctx, `select api.create_budget('Budget Money Test')`).Scan(&budgetUUID)
+	is.NoErr(err)
+
+	var checkingUUID string
+	err = conn.QueryRow(ctx, `select api.add_account($1, 'Checking', 'bank')`, budgetUUID).Scan(&checkingUUID)
+	is.NoErr(err)
+
+	var groceriesUUID string
+	err = conn.QueryRow(ctx, `select uuid from api.add_category($1, 'Groceries')`, budgetUUID).Scan(&groceriesUUID)
+	is.NoErr(err)
+
+	var rentUUID string
+	err = conn.QueryRow(ctx, `select uuid from api.add_category($1, 'Rent')`, budgetUUID).Scan(&rentUUID)
+	is.NoErr(err)
+
+	// look up Income account for balance checks
+	var incomeUUID string
+	err = conn.QueryRow(ctx, `
+		select a.uuid from data.accounts a
+		join data.ledgers l on a.ledger_id = l.id
+		where l.uuid = $1 and a.name = 'Income' and a.type = 'equity'
+	`, budgetUUID).Scan(&incomeUUID)
+	is.NoErr(err)
+
+	// seed income
+	_, err = conn.Exec(ctx, `select api.record_income($1, $2, 300000, 'Paycheck', '2025-03-01')`, budgetUUID, checkingUUID)
+	is.NoErr(err)
+
+	t.Run("BudgetToCategory", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select api.budget_money($1, $2, 50000, 'March groceries', '2025-03-01')
+		`, budgetUUID, groceriesUUID).Scan(&txUUID)
+		is.NoErr(err)
+		is.True(len(txUUID) == 8)
+	})
+
+	t.Run("CategoryBalanceIncreases", func(t *testing.T) {
+		is := is_.New(t)
+
+		var balance int64
+		err := conn.QueryRow(ctx, `select api.get_account_balance($1)`, groceriesUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(50000))
+	})
+
+	t.Run("AvailableToBudgetDecreases", func(t *testing.T) {
+		is := is_.New(t)
+
+		// Income started at 300000, budgeted 50000
+		var balance int64
+		err := conn.QueryRow(ctx, `select api.get_account_balance($1)`, incomeUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(250000))
+	})
+
+	t.Run("DescriptionIsOptional", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select api.budget_money($1, $2, 150000)
+		`, budgetUUID, rentUUID).Scan(&txUUID)
+		is.NoErr(err)
+		is.True(len(txUUID) == 8)
+	})
+
+	t.Run("DefaultDateIsToday", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select api.budget_money($1, $2, 1000, 'Small budget')
+		`, budgetUUID, groceriesUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		var txDate time.Time
+		err = conn.QueryRow(ctx, `select date from data.transactions where uuid = $1`, txUUID).Scan(&txDate)
+		is.NoErr(err)
+
+		now := time.Now()
+		is.Equal(txDate.Year(), now.Year())
+		is.Equal(txDate.Month(), now.Month())
+		is.Equal(txDate.Day(), now.Day())
+	})
+
+	t.Run("RejectZeroAmount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select api.budget_money($1, $2, 0)`, budgetUUID, groceriesUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectNegativeAmount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select api.budget_money($1, $2, -100)`, budgetUUID, groceriesUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectInvalidCategory", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select api.budget_money($1, 'nonexistent', 1000)`, budgetUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectInvalidBudget", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select api.budget_money('nonexistent', $1, 1000)`, groceriesUUID)
+		is.True(err != nil)
+	})
+}
