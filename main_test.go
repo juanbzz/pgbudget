@@ -4555,3 +4555,149 @@ func TestCreateBudget(t *testing.T) {
 		is.NoErr(err)
 	})
 }
+
+func TestAddAccount(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "add_account_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	// create a budget to add accounts to
+	var budgetUUID string
+	err = conn.QueryRow(ctx, `select api.create_budget('Account Test Budget')`).Scan(&budgetUUID)
+	is.NoErr(err)
+
+	t.Run("CreateBankAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		var accountUUID string
+		err := conn.QueryRow(ctx, `select api.add_account($1, 'Checking', 'bank')`, budgetUUID).Scan(&accountUUID)
+		is.NoErr(err)
+		is.True(len(accountUUID) == 8)
+
+		// verify it's stored as asset/asset_like
+		var accType, internalType string
+		err = conn.QueryRow(ctx, `select type, internal_type from data.accounts where uuid = $1`, accountUUID).Scan(&accType, &internalType)
+		is.NoErr(err)
+		is.Equal(accType, "asset")
+		is.Equal(internalType, "asset_like")
+	})
+
+	t.Run("CreateCreditCardAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		var accountUUID string
+		err := conn.QueryRow(ctx, `select api.add_account($1, 'Visa', 'credit_card')`, budgetUUID).Scan(&accountUUID)
+		is.NoErr(err)
+
+		var accType, internalType string
+		err = conn.QueryRow(ctx, `select type, internal_type from data.accounts where uuid = $1`, accountUUID).Scan(&accType, &internalType)
+		is.NoErr(err)
+		is.Equal(accType, "liability")
+		is.Equal(internalType, "liability_like")
+	})
+
+	t.Run("CreateCashAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		var accountUUID string
+		err := conn.QueryRow(ctx, `select api.add_account($1, 'Wallet', 'cash')`, budgetUUID).Scan(&accountUUID)
+		is.NoErr(err)
+
+		var accType, internalType string
+		err = conn.QueryRow(ctx, `select type, internal_type from data.accounts where uuid = $1`, accountUUID).Scan(&accType, &internalType)
+		is.NoErr(err)
+		is.Equal(accType, "asset")
+		is.Equal(internalType, "asset_like")
+	})
+
+	t.Run("AcceptsAccountingTypes", func(t *testing.T) {
+		is := is_.New(t)
+
+		// 'asset' should work and map to asset
+		var uuid1 string
+		err := conn.QueryRow(ctx, `select api.add_account($1, 'Savings', 'asset')`, budgetUUID).Scan(&uuid1)
+		is.NoErr(err)
+
+		var type1 string
+		err = conn.QueryRow(ctx, `select type from data.accounts where uuid = $1`, uuid1).Scan(&type1)
+		is.NoErr(err)
+		is.Equal(type1, "asset")
+
+		// 'liability' should work and map to liability
+		var uuid2 string
+		err = conn.QueryRow(ctx, `select api.add_account($1, 'Loan', 'liability')`, budgetUUID).Scan(&uuid2)
+		is.NoErr(err)
+
+		var type2 string
+		err = conn.QueryRow(ctx, `select type from data.accounts where uuid = $1`, uuid2).Scan(&type2)
+		is.NoErr(err)
+		is.Equal(type2, "liability")
+	})
+
+	t.Run("DescriptionIsOptional", func(t *testing.T) {
+		is := is_.New(t)
+
+		var uuid1 string
+		err := conn.QueryRow(ctx, `select api.add_account($1, 'No Desc Acct', 'bank')`, budgetUUID).Scan(&uuid1)
+		is.NoErr(err)
+
+		var uuid2 string
+		err = conn.QueryRow(ctx, `select api.add_account($1, 'With Desc Acct', 'bank', 'My checking')`, budgetUUID).Scan(&uuid2)
+		is.NoErr(err)
+
+		var desc *string
+		err = conn.QueryRow(ctx, `select description from data.accounts where uuid = $1`, uuid2).Scan(&desc)
+		is.NoErr(err)
+		is.True(desc != nil)
+		is.Equal(*desc, "My checking")
+	})
+
+	t.Run("RejectEquityType", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select api.add_account($1, 'Groceries', 'equity')`, budgetUUID)
+		is.True(err != nil) // should reject equity — use add_category instead
+	})
+
+	t.Run("RejectInvalidType", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select api.add_account($1, 'Savings', 'savings')`, budgetUUID)
+		is.True(err != nil) // 'savings' is not a valid type
+	})
+
+	t.Run("RejectInvalidBudget", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select api.add_account('nonexistent', 'Checking', 'bank')`)
+		is.True(err != nil) // budget doesn't exist
+	})
+
+	t.Run("RejectDuplicateName", func(t *testing.T) {
+		is := is_.New(t)
+
+		var uuid string
+		err := conn.QueryRow(ctx, `select api.add_account($1, 'Duplicate Acct', 'bank')`, budgetUUID).Scan(&uuid)
+		is.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select api.add_account($1, 'Duplicate Acct', 'bank')`, budgetUUID)
+		is.True(err != nil) // duplicate name in same budget
+	})
+
+	t.Run("RejectEmptyName", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select api.add_account($1, '', 'bank')`, budgetUUID)
+		is.True(err != nil)
+
+		_, err = conn.Exec(ctx, `select api.add_account($1, '   ', 'bank')`, budgetUUID)
+		is.True(err != nil)
+	})
+}
