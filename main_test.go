@@ -4859,3 +4859,201 @@ func TestRecordIncome(t *testing.T) {
 		is.True(err != nil)
 	})
 }
+
+func TestRecordExpense(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "record_expense_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	// set up budget, accounts, categories, and seed income
+	var budgetUUID string
+	err = conn.QueryRow(ctx, `select api.create_budget('Expense Test Budget')`).Scan(&budgetUUID)
+	is.NoErr(err)
+
+	var checkingUUID string
+	err = conn.QueryRow(ctx, `select api.add_account($1, 'Checking', 'bank')`, budgetUUID).Scan(&checkingUUID)
+	is.NoErr(err)
+
+	var visaUUID string
+	err = conn.QueryRow(ctx, `select api.add_account($1, 'Visa', 'credit_card')`, budgetUUID).Scan(&visaUUID)
+	is.NoErr(err)
+
+	var groceriesUUID string
+	err = conn.QueryRow(ctx, `select uuid from api.add_category($1, 'Groceries')`, budgetUUID).Scan(&groceriesUUID)
+	is.NoErr(err)
+
+	// look up Unassigned uuid for verification
+	var unassignedUUID string
+	err = conn.QueryRow(ctx, `
+		select a.uuid from data.accounts a
+		join data.ledgers l on a.ledger_id = l.id
+		where l.uuid = $1 and a.name = 'Unassigned' and a.type = 'equity'
+	`, budgetUUID).Scan(&unassignedUUID)
+	is.NoErr(err)
+
+	// seed with income so we have money to spend
+	_, err = conn.Exec(ctx, `select api.record_income($1, $2, 500000, 'Paycheck', '2025-03-01')`, budgetUUID, checkingUUID)
+	is.NoErr(err)
+
+	// budget some money to groceries
+	_, err = conn.Exec(ctx, `select api.assign_to_category($1, '2025-03-01', 'Budget groceries', 100000, $2)`, budgetUUID, groceriesUUID)
+	is.NoErr(err)
+
+	t.Run("ExpenseFromBankWithCategory", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select api.record_expense($1, $2, 8500, $3, 'Whole Foods', '2025-03-18')
+		`, budgetUUID, checkingUUID, groceriesUUID).Scan(&txUUID)
+		is.NoErr(err)
+		is.True(len(txUUID) == 8)
+	})
+
+	t.Run("ExpenseFromCreditCard", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select api.record_expense($1, $2, 4200, $3, 'Gas station', '2025-03-20')
+		`, budgetUUID, visaUUID, groceriesUUID).Scan(&txUUID)
+		is.NoErr(err)
+		is.True(len(txUUID) == 8)
+	})
+
+	t.Run("ExpenseWithoutCategoryGoesToUnassigned", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select api.record_expense($1, $2, 1000, null, 'Random purchase', '2025-03-21')
+		`, budgetUUID, checkingUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		// verify it used the Unassigned category
+		var debitUUID string
+		err = conn.QueryRow(ctx, `
+			select (select uuid from data.accounts where id = t.debit_account_id)
+			from data.transactions t where t.uuid = $1
+		`, txUUID).Scan(&debitUUID)
+		is.NoErr(err)
+		is.Equal(debitUUID, unassignedUUID) // debit = Unassigned (category decreases)
+	})
+
+	t.Run("BankBalanceDecreases", func(t *testing.T) {
+		is := is_.New(t)
+
+		// checking started at 500000, spent 8500 + 1000 = 9500
+		var balance int64
+		err := conn.QueryRow(ctx, `select api.get_account_balance($1)`, checkingUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(500000-8500-1000)) // 490500
+	})
+
+	t.Run("CorrectDebitCreditForBank", func(t *testing.T) {
+		is := is_.New(t)
+
+		// for outflow from asset: debit = category (decrease), credit = bank (decrease)
+		var debitUUID, creditUUID string
+		err := conn.QueryRow(ctx, `
+			select
+				(select uuid from data.accounts where id = t.debit_account_id),
+				(select uuid from data.accounts where id = t.credit_account_id)
+			from data.transactions t
+			where t.description = 'Whole Foods'
+			  and t.user_data = $1
+		`, testUserID).Scan(&debitUUID, &creditUUID)
+		is.NoErr(err)
+		is.Equal(debitUUID, groceriesUUID) // debit = Groceries (equity decreases)
+		is.Equal(creditUUID, checkingUUID) // credit = Checking (asset decreases)
+	})
+
+	t.Run("CorrectDebitCreditForCreditCard", func(t *testing.T) {
+		is := is_.New(t)
+
+		// for outflow from liability: debit = account (liability), credit = category
+		var debitUUID, creditUUID string
+		err := conn.QueryRow(ctx, `
+			select
+				(select uuid from data.accounts where id = t.debit_account_id),
+				(select uuid from data.accounts where id = t.credit_account_id)
+			from data.transactions t
+			where t.description = 'Gas station'
+			  and t.user_data = $1
+		`, testUserID).Scan(&debitUUID, &creditUUID)
+		is.NoErr(err)
+		is.Equal(debitUUID, visaUUID)       // debit = Visa (liability)
+		is.Equal(creditUUID, groceriesUUID) // credit = Groceries (equity)
+	})
+
+	t.Run("DefaultDateIsToday", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select api.record_expense($1, $2, 500, $3, 'Quick expense')
+		`, budgetUUID, checkingUUID, groceriesUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		var txDate time.Time
+		err = conn.QueryRow(ctx, `select date from data.transactions where uuid = $1`, txUUID).Scan(&txDate)
+		is.NoErr(err)
+
+		now := time.Now()
+		is.Equal(txDate.Year(), now.Year())
+		is.Equal(txDate.Month(), now.Month())
+		is.Equal(txDate.Day(), now.Day())
+	})
+
+	t.Run("RejectZeroAmount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.record_expense($1, $2, 0, $3, 'Zero', '2025-03-15')
+		`, budgetUUID, checkingUUID, groceriesUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectNegativeAmount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.record_expense($1, $2, -100, $3, 'Negative', '2025-03-15')
+		`, budgetUUID, checkingUUID, groceriesUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectInvalidAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.record_expense($1, 'nonexistent', 100, $2, 'Bad', '2025-03-15')
+		`, budgetUUID, groceriesUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectInvalidBudget", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.record_expense('nonexistent', $1, 100, $2, 'Bad', '2025-03-15')
+		`, checkingUUID, groceriesUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectInvalidCategory", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.record_expense($1, $2, 100, 'nonexistent', 'Bad', '2025-03-15')
+		`, budgetUUID, checkingUUID)
+		is.True(err != nil)
+	})
+}
