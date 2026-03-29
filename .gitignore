@@ -196,3 +196,5 @@ migrations_old
 .crush.json
 
 nogit_docs
+.claude
+.context

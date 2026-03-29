@@ -4361,3 +4361,74 @@ func TestCategoryGroups(t *testing.T) {
 		is.True(groupID == nil) // Should be null
 	})
 }
+
+func TestMetadata(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	t.Run("TableExists", func(t *testing.T) {
+		is := is_.New(t)
+
+		var exists bool
+		err := conn.QueryRow(ctx, `
+			select exists (
+				select 1 from information_schema.tables
+				where table_schema = 'utils' and table_name = 'metadata'
+			)
+		`).Scan(&exists)
+		is.NoErr(err)
+		is.True(exists) // utils.metadata table should exist
+	})
+
+	t.Run("InsertAndRead", func(t *testing.T) {
+		is := is_.New(t)
+
+		// insert a version
+		_, err := conn.Exec(ctx, `
+			insert into utils.metadata (key, value)
+			values ('version', 'v0.1.0')
+			on conflict (key) do update set value = 'v0.1.0'
+		`)
+		is.NoErr(err)
+
+		// read it back
+		var value string
+		err = conn.QueryRow(ctx, `
+			select value from utils.metadata where key = 'version'
+		`).Scan(&value)
+		is.NoErr(err)
+		is.Equal(value, "v0.1.0") // should read back the version we inserted
+	})
+
+	t.Run("UpsertUpdatesValue", func(t *testing.T) {
+		is := is_.New(t)
+
+		// upsert to a new version
+		_, err := conn.Exec(ctx, `
+			insert into utils.metadata (key, value)
+			values ('version', 'v0.2.0')
+			on conflict (key) do update set value = 'v0.2.0'
+		`)
+		is.NoErr(err)
+
+		var value string
+		err = conn.QueryRow(ctx, `
+			select value from utils.metadata where key = 'version'
+		`).Scan(&value)
+		is.NoErr(err)
+		is.Equal(value, "v0.2.0") // should be updated to v0.2.0
+	})
+
+	t.Run("RejectNullValue", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			insert into utils.metadata (key, value) values ('test_key', null)
+		`)
+		is.True(err != nil) // should reject null value
+	})
+}
