@@ -4432,3 +4432,126 @@ func TestMetadata(t *testing.T) {
 		is.True(err != nil) // should reject null value
 	})
 }
+
+func TestCreateBudget(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "create_budget_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	t.Run("CreatesBudgetAndReturnsUUID", func(t *testing.T) {
+		is := is_.New(t)
+
+		var budgetUUID string
+		err := conn.QueryRow(ctx, `select api.create_budget('My Budget 2025')`).Scan(&budgetUUID)
+		is.NoErr(err)
+		is.True(len(budgetUUID) == 8) // should return 8-char nanoid
+	})
+
+	t.Run("DefaultAccountsCreated", func(t *testing.T) {
+		is := is_.New(t)
+
+		var budgetUUID string
+		err := conn.QueryRow(ctx, `select api.create_budget('Budget With Defaults')`).Scan(&budgetUUID)
+		is.NoErr(err)
+
+		// check that Income, Off-budget, Unassigned accounts were created
+		var accountNames []string
+		rows, err := conn.Query(ctx, `
+			select a.name from data.accounts a
+			join data.ledgers l on a.ledger_id = l.id
+			where l.uuid = $1 and a.type = 'equity'
+			order by a.name
+		`, budgetUUID)
+		is.NoErr(err)
+		defer rows.Close()
+
+		for rows.Next() {
+			var name string
+			err := rows.Scan(&name)
+			is.NoErr(err)
+			accountNames = append(accountNames, name)
+		}
+		is.NoErr(rows.Err())
+
+		is.True(contains(accountNames, "Income"))
+		is.True(contains(accountNames, "Off-budget"))
+		is.True(contains(accountNames, "Unassigned"))
+	})
+
+	t.Run("DescriptionIsOptional", func(t *testing.T) {
+		is := is_.New(t)
+
+		// without description
+		var uuid1 string
+		err := conn.QueryRow(ctx, `select api.create_budget('No Desc Budget')`).Scan(&uuid1)
+		is.NoErr(err)
+
+		// with description
+		var uuid2 string
+		err = conn.QueryRow(ctx, `select api.create_budget('Desc Budget', 'A family budget')`).Scan(&uuid2)
+		is.NoErr(err)
+
+		// verify description was stored
+		var desc *string
+		err = conn.QueryRow(ctx, `select description from data.ledgers where uuid = $1`, uuid2).Scan(&desc)
+		is.NoErr(err)
+		is.True(desc != nil)
+		is.Equal(*desc, "A family budget")
+	})
+
+	t.Run("EmptyNameRejected", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select api.create_budget('')`)
+		is.True(err != nil) // should reject empty name
+	})
+
+	t.Run("WhitespaceOnlyNameRejected", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select api.create_budget('   ')`)
+		is.True(err != nil) // should reject whitespace-only name
+	})
+
+	t.Run("DuplicateNameRejected", func(t *testing.T) {
+		is := is_.New(t)
+
+		var uuid string
+		err := conn.QueryRow(ctx, `select api.create_budget('Unique Budget Name')`).Scan(&uuid)
+		is.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select api.create_budget('Unique Budget Name')`)
+		is.True(err != nil) // should reject duplicate name for same user
+	})
+
+	t.Run("DifferentUsersCanHaveSameName", func(t *testing.T) {
+		is := is_.New(t)
+
+		// create budget as current user
+		var uuid1 string
+		err := conn.QueryRow(ctx, `select api.create_budget('Shared Name Budget')`).Scan(&uuid1)
+		is.NoErr(err)
+
+		// switch to a different user
+		err = setTestUserContext(ctx, conn, "another_user")
+		is.NoErr(err)
+
+		// same name should work for different user
+		var uuid2 string
+		err = conn.QueryRow(ctx, `select api.create_budget('Shared Name Budget')`).Scan(&uuid2)
+		is.NoErr(err)
+
+		is.True(uuid1 != uuid2) // should be different budgets
+
+		// switch back
+		err = setTestUserContext(ctx, conn, testUserID)
+		is.NoErr(err)
+	})
+}
