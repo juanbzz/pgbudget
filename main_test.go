@@ -4701,3 +4701,161 @@ func TestAddAccount(t *testing.T) {
 		is.True(err != nil)
 	})
 }
+
+func TestRecordIncome(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "record_income_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	// set up budget + accounts
+	var budgetUUID string
+	err = conn.QueryRow(ctx, `select api.create_budget('Income Test Budget')`).Scan(&budgetUUID)
+	is.NoErr(err)
+
+	var checkingUUID string
+	err = conn.QueryRow(ctx, `select api.add_account($1, 'Checking', 'bank')`, budgetUUID).Scan(&checkingUUID)
+	is.NoErr(err)
+
+	var cashUUID string
+	err = conn.QueryRow(ctx, `select api.add_account($1, 'Wallet', 'cash')`, budgetUUID).Scan(&cashUUID)
+	is.NoErr(err)
+
+	// look up Income account uuid for verification
+	var incomeUUID string
+	err = conn.QueryRow(ctx, `
+		select a.uuid from data.accounts a
+		join data.ledgers l on a.ledger_id = l.id
+		where l.uuid = $1 and a.name = 'Income' and a.type = 'equity'
+	`, budgetUUID).Scan(&incomeUUID)
+	is.NoErr(err)
+
+	t.Run("IncomeToBank", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select api.record_income($1, $2, 300000, 'Paycheck', '2025-03-15')
+		`, budgetUUID, checkingUUID).Scan(&txUUID)
+		is.NoErr(err)
+		is.True(len(txUUID) == 8)
+	})
+
+	t.Run("IncomeToCash", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select api.record_income($1, $2, 5000, 'Found money', '2025-03-16')
+		`, budgetUUID, cashUUID).Scan(&txUUID)
+		is.NoErr(err)
+		is.True(len(txUUID) == 8)
+	})
+
+	t.Run("AccountBalanceIncreases", func(t *testing.T) {
+		is := is_.New(t)
+
+		// checking should have 300000 from the first income
+		var balance int64
+		err := conn.QueryRow(ctx, `select api.get_account_balance($1)`, checkingUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(300000))
+	})
+
+	t.Run("IncomeGoesToIncomeAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		// verify the transaction credits the Income account, not Unassigned
+		var creditAccountUUID string
+		err := conn.QueryRow(ctx, `
+			select a.uuid from data.transactions t
+			join data.accounts a on a.id = t.credit_account_id
+			where t.description = 'Paycheck'
+			  and t.user_data = $1
+		`, testUserID).Scan(&creditAccountUUID)
+		is.NoErr(err)
+		is.Equal(creditAccountUUID, incomeUUID) // should be Income, not Unassigned
+	})
+
+	t.Run("CorrectDebitCredit", func(t *testing.T) {
+		is := is_.New(t)
+
+		// for income: debit = bank account (increase asset), credit = Income (increase equity)
+		var debitUUID, creditUUID string
+		err := conn.QueryRow(ctx, `
+			select
+				(select uuid from data.accounts where id = t.debit_account_id),
+				(select uuid from data.accounts where id = t.credit_account_id)
+			from data.transactions t
+			where t.description = 'Paycheck'
+			  and t.user_data = $1
+		`, testUserID).Scan(&debitUUID, &creditUUID)
+		is.NoErr(err)
+		is.Equal(debitUUID, checkingUUID) // debit = checking (asset increases)
+		is.Equal(creditUUID, incomeUUID)  // credit = Income (equity increases)
+	})
+
+	t.Run("DefaultDateIsToday", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select api.record_income($1, $2, 1000, 'Quick income')
+		`, budgetUUID, checkingUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		// verify the date is today
+		var txDate time.Time
+		err = conn.QueryRow(ctx, `
+			select date from data.transactions where uuid = $1
+		`, txUUID).Scan(&txDate)
+		is.NoErr(err)
+
+		now := time.Now()
+		is.Equal(txDate.Year(), now.Year())
+		is.Equal(txDate.Month(), now.Month())
+		is.Equal(txDate.Day(), now.Day())
+	})
+
+	t.Run("RejectZeroAmount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.record_income($1, $2, 0, 'Zero', '2025-03-15')
+		`, budgetUUID, checkingUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectNegativeAmount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.record_income($1, $2, -100, 'Negative', '2025-03-15')
+		`, budgetUUID, checkingUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectInvalidAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.record_income($1, 'nonexistent', 100, 'Bad account', '2025-03-15')
+		`, budgetUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectInvalidBudget", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.record_income('nonexistent', $1, 100, 'Bad budget', '2025-03-15')
+		`, checkingUUID)
+		is.True(err != nil)
+	})
+}
