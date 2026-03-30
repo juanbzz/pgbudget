@@ -5415,3 +5415,38 @@ func TestAccountBalanceCounters(t *testing.T) {
 		is.Equal(creditsTotal, int64(0))
 	})
 }
+
+func TestBalancesTable(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	t.Run("TableExists", func(t *testing.T) {
+		is := is_.New(t)
+
+		var exists bool
+		err := conn.QueryRow(ctx, `
+			select exists (
+				select 1 from information_schema.tables
+				where table_schema = 'data' and table_name = 'balances'
+			)
+		`).Scan(&exists)
+		is.NoErr(err)
+		is.True(exists)
+	})
+
+	t.Run("RLSEnabled", func(t *testing.T) {
+		is := is_.New(t)
+
+		var rlsEnabled bool
+		err := conn.QueryRow(ctx, `
+			select relrowsecurity from pg_class
+			where oid = 'data.balances'::regclass
+		`).Scan(&rlsEnabled)
+		is.NoErr(err)
+		is.True(rlsEnabled)
+	})
+}
