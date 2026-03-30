@@ -5358,3 +5358,60 @@ func TestMoveMoney(t *testing.T) {
 		is.True(err != nil)
 	})
 }
+
+func TestAccountBalanceCounters(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	t.Run("ColumnsExist", func(t *testing.T) {
+		is := is_.New(t)
+
+		var debitExists, creditExists bool
+		err := conn.QueryRow(ctx, `
+			select exists (
+				select 1 from information_schema.columns
+				where table_schema = 'data' and table_name = 'accounts' and column_name = 'debits_total'
+			)
+		`).Scan(&debitExists)
+		is.NoErr(err)
+		is.True(debitExists)
+
+		err = conn.QueryRow(ctx, `
+			select exists (
+				select 1 from information_schema.columns
+				where table_schema = 'data' and table_name = 'accounts' and column_name = 'credits_total'
+			)
+		`).Scan(&creditExists)
+		is.NoErr(err)
+		is.True(creditExists)
+	})
+
+	t.Run("DefaultToZero", func(t *testing.T) {
+		is := is_.New(t)
+
+		testUserID := "balance_counters_test_user"
+		err := setTestUserContext(ctx, conn, testUserID)
+		is.NoErr(err)
+
+		// create a budget + account to check defaults
+		var budgetUUID string
+		err = conn.QueryRow(ctx, `select api.create_budget('Counter Test')`).Scan(&budgetUUID)
+		is.NoErr(err)
+
+		var accountUUID string
+		err = conn.QueryRow(ctx, `select api.add_account($1, 'Checking', 'bank')`, budgetUUID).Scan(&accountUUID)
+		is.NoErr(err)
+
+		var debitsTotal, creditsTotal int64
+		err = conn.QueryRow(ctx, `
+			select debits_total, credits_total from data.accounts where uuid = $1
+		`, accountUUID).Scan(&debitsTotal, &creditsTotal)
+		is.NoErr(err)
+		is.Equal(debitsTotal, int64(0))
+		is.Equal(creditsTotal, int64(0))
+	})
+}

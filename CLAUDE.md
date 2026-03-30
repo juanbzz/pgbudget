@@ -4,172 +4,111 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-pgbudget is a PostgreSQL-based zero-sum budgeting database engine implementing double-entry accounting principles for personal finance applications. It provides a complete database foundation for budgeting apps similar to YNAB.
+pgbudget is a PostgreSQL budgeting engine. It uses double-entry accounting internally, but the API speaks budgeting language — income, expenses, categories, transfers. The double-entry mechanics are invisible to consumers.
+
+**Identity:** Engine, not app. No payees, tags, goals, auth, or UI concerns. The `metadata` jsonb column is the escape hatch for consumer apps.
+
+**Immutability:** Transactions are never edited or deleted. Corrections and voids create reversals. The books are always provably correct.
 
 ## Development Commands
 
 ### Database Migrations (using Goose)
 ```bash
-# Run all pending migrations
-task migrate:up
-
-# Run one migration
-task migrate:up-one
-
-# Rollback last migration  
-task migrate:down
-
-# Drop all migrations
-task migrate:drop
-
-# Show migration status
-task migrate:status
-
-# Create new migration
-task migrate:new -- migration_name
-```
-
-### Release Management
-```bash
-# Create a new release (generates all artifacts)
-./scripts/create_release.sh v0.5.0
-
-# Install latest release
-export DATABASE_URL="postgres://user:pass@localhost:5432/dbname"
-./scripts/install.sh
-
-# Install specific version
-./scripts/install.sh v0.4.0
+task migrate:up          # Run all pending migrations
+task migrate:up-one      # Run one migration
+task migrate:down        # Rollback last migration
+task migrate:drop        # Drop all migrations
+task migrate:status      # Show migration status
+task migrate:new -- name # Create new migration
 ```
 
 ### Testing
 ```bash
-# Run all tests
-go test -v
-
-# Run specific test
-go test -v -run TestFunctionName
+go test -v               # Run all tests
+go test -v -run TestName # Run specific test
 ```
 
-### Build and Run
-```bash
-# Build the project
-go build -o pgbudget
-
-# Run the main program
-go run main.go
-```
+Tests require Docker via Colima. The `.envrc` sets `DOCKER_HOST` and `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE` for testcontainers.
 
 ## Architecture
 
-### Database Schema Design
-The database uses a three-schema architecture:
+### Three-schema design
+- **`data`**: Tables, constraints, RLS policies. Accounting vocabulary is fine here.
+- **`utils`**: Internal business logic. Accounting vocabulary (debit/credit, asset/liability). `SECURITY DEFINER`.
+- **`api`**: Public interface. **Budgeting vocabulary only** (budget, income, expense, category, transfer, void, correct).
 
-- **`data`**: Raw tables with primary keys, constraints, and RLS policies
-- **`utils`**: Internal business logic functions (not exposed publicly)
-- **`api`**: Public interface functions accepting UUID parameters
+### API vocabulary mapping
 
-### Key Principles
-- **Zero-sum budgeting**: Every dollar of income is allocated to budget categories
-- **Double-entry accounting**: All transactions maintain the accounting equation (Assets = Liabilities + Equity)
-- **Multi-tenant**: Row Level Security (RLS) ensures users only see their own data
-- **UUID-based APIs**: Public functions use UUIDs while internal functions use bigint IDs
+| API (public) | Internal (utils/data) |
+|---|---|
+| Budget | Ledger |
+| `bank`, `credit_card`, `cash` | `asset`, `liability` |
+| Category | Equity account |
+| `record_income` | inflow transaction |
+| `record_expense` | outflow transaction |
+| `budget_money` | assign_to_category |
+| `move_money` | category-to-category transfer |
+| `transfer` | account-to-account transfer |
+| `void` | delete_transaction (reversal) |
+| `correct` | correct_transaction (reversal + new) |
 
-### Account Types
-- **Assets**: Bank accounts, cash
-- **Liabilities**: Credit cards, loans  
-- **Equity**: Income (unallocated funds) and budget categories (allocated funds)
+### New API functions (v0.1.0 in progress)
+```sql
+api.create_budget(name, description?)              -- returns uuid
+api.add_account(budget, name, type, description?)  -- type: bank/credit_card/cash/asset/liability
+api.add_category(budget, name)                     -- existing, unchanged
+api.record_income(budget, account, amount, desc, date?)
+api.record_expense(budget, account, amount, category?, desc, date?)
+api.budget_money(budget, category, amount, desc?, date?)
+api.move_money(budget, from_cat, to_cat, amount, desc?, date?)
+api.transfer(budget, from_acct, to_acct, amount, desc?, date?)  -- not yet implemented
+api.void(transaction, reason?)                                    -- not yet implemented
+api.correct(transaction, ...changed_fields, reason?)              -- not yet implemented
+```
+
+### Legacy API (still works, will be deprecated)
+```sql
+INSERT INTO api.ledgers (name) VALUES (...)
+INSERT INTO api.accounts (ledger_uuid, name, type) VALUES (...)
+INSERT INTO api.transactions (...)  -- via INSTEAD OF INSERT trigger
+api.add_transaction(ledger, date, desc, type, amount, account, category?)
+api.assign_to_category(ledger, date, desc, amount, category)
+api.correct_transaction(...)
+api.delete_transaction(...)
+```
 
 ## Development Conventions
 
-### PostgreSQL Code Style
-- Write SQL queries in lowercase
+### PostgreSQL code style
+- Write SQL in lowercase
 - Add comments above each query step
-- Use `bigint generated always as identity` for primary keys
-- Define table constraints rather than column constraints
-- Follow naming: `<table>_<column>_<constraint>_<type>`
+- `bigint generated always as identity` for primary keys
+- Table-level constraints named `{table}_{column}_{constraint_type}`
+- Triggers named `{table}_{purpose}_tg`
+- Follow conventions from `/Users/juanolvera/sync/proj/2025-04-24-conventions/src/conventions/postgres/`
 
-### Function Organization
-- **API functions**: Accept UUIDs, provide user-friendly interface
-- **Utils functions**: Accept bigint IDs, handle internal logic
-- **Mutations**: Use api schema functions for safety and convenience
-- **Queries**: Direct access to data schema is acceptable
+### Function patterns
+- **New API functions**: Simple, return UUID (text). Accept budgeting vocabulary.
+- **Utils functions**: Accept text UUIDs, handle internal logic, return int IDs.
+- **Each step is one commit**: migration + tests. All existing tests stay green.
 
 ### Testing
-- Uses testcontainers for PostgreSQL integration testing
-- Each test sets up isolated database state
-- Tests validate both API functions and direct SQL queries
-- Test user context with `set_config('app.current_user_id', 'user_id', false)`
+- Uses testcontainers (Docker via Colima) for PostgreSQL integration testing
+- Each test function gets its own connection and user context
+- Test user context: `set_config('app.current_user_id', 'user_id', false)`
+- Tests are the reference documentation for how to use the API
 
-## Key Features
+## Current plan
 
-### Core Functionality
-- Create ledgers (budgets) with automatic default accounts
-- Add asset/liability accounts and budget categories  
-- Record income and spending transactions
-- Assign money from income to budget categories
-- Real-time balance calculations and budget status reporting
+See `nogit_docs/V1_PLAN.md` for the full v0.1.0 plan.
 
-### Category Groups (v0.4.0+)
-- Organize categories into logical groups (Household, Transportation, etc.)
-- Filter budget reports by category groups
-- Group management with sort order for UI organization
-- Maintain category relationships when groups are deleted
-- Complete API: `api.add_group()`, `api.get_groups()`, `api.assign_category_to_group()`, `api.delete_group()`
+Steps 1-8 are complete. Remaining: `api.transfer()`, `api.void()`, `api.correct()`, reporting renames, `api.delete_budget()`, deprecation wrappers, test migration, release.
 
-### Transaction Management
-- Correct existing transactions with audit trail
-- Delete transactions with proper accounting reversals
-- Complete transaction history with running balances
+## File structure
 
-## File Structure
-
-### Migrations (`/migrations/`)
-- Chronological SQL files managed by Goose
-- Each migration creates tables, functions, views, or triggers
-- Implements RLS policies and database constraints
-
-### Releases (`/releases/`)
-- Version-specific release artifacts for distribution
-- Each release contains complete schema and upgrade scripts
-- Generated by `scripts/create_release.sh`
-
-### Scripts (`/scripts/`)
-- `create_release.sh`: Generate release artifacts
-- `install.sh`: Install pgbudget from releases
-
-### Test Files
-- `main_test.go`: Comprehensive integration tests
-- `testutils/pgcontainer/`: PostgreSQL container setup utilities
-
-### Documentation
-- `README.md`: User-facing API documentation and examples
-- `ARCHITECTURE.md`: Detailed technical architecture
-- `CONVENTIONS.md`: Development coding standards
-- `SPEC.md`: Budgeting methodology and business rules
-- `DJANGO_IMPLEMENTATION.md`: Guide for Django integration
-- `MULTITENANCY.md`: Multi-tenant architecture with service users
-
-## Testing Setup
-
-Set user context at the beginning of each test session:
-```sql
-SELECT set_config('app.current_user_id', 'test_user_123', false);
-```
-
-This ensures RLS policies work correctly and data is properly isolated between users.
-
-## Common Development Patterns
-
-### Creating API Functions
-1. Write utils function with bigint parameters for internal logic
-2. Create api function wrapper that accepts UUIDs and calls utils function
-3. Add proper error handling and input validation
-4. Include comprehensive tests for both happy path and edge cases
-
-### Adding New Tables
-1. Create migration with proper RLS policy
-2. Add utils functions for CRUD operations  
-3. Create api wrapper functions
-4. Update relevant views and triggers
-5. Add comprehensive test coverage
+- `migrations/` — Goose SQL migrations (chronological)
+- `releases/` — Version snapshots (schema.sql, upgrade scripts)
+- `scripts/` — Release and install scripts
+- `nogit_docs/` — Planning docs, not tracked in releases
+- `main_test.go` — Integration tests
+- `testutils/pgcontainer/` — PostgreSQL container setup
