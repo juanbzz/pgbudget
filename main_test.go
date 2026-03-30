@@ -5188,3 +5188,173 @@ func TestBudgetMoney(t *testing.T) {
 		is.True(err != nil)
 	})
 }
+
+func TestMoveMoney(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "move_money_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	// set up budget, account, categories, seed income + budget
+	var budgetUUID string
+	err = conn.QueryRow(ctx, `select api.create_budget('Move Money Test')`).Scan(&budgetUUID)
+	is.NoErr(err)
+
+	var checkingUUID string
+	err = conn.QueryRow(ctx, `select api.add_account($1, 'Checking', 'bank')`, budgetUUID).Scan(&checkingUUID)
+	is.NoErr(err)
+
+	var groceriesUUID string
+	err = conn.QueryRow(ctx, `select uuid from api.add_category($1, 'Groceries')`, budgetUUID).Scan(&groceriesUUID)
+	is.NoErr(err)
+
+	var entertainmentUUID string
+	err = conn.QueryRow(ctx, `select uuid from api.add_category($1, 'Entertainment')`, budgetUUID).Scan(&entertainmentUUID)
+	is.NoErr(err)
+
+	// seed: income → budget both categories
+	_, err = conn.Exec(ctx, `select api.record_income($1, $2, 200000, 'Paycheck', '2025-03-01')`, budgetUUID, checkingUUID)
+	is.NoErr(err)
+	_, err = conn.Exec(ctx, `select api.budget_money($1, $2, 100000, 'Groceries budget', '2025-03-01')`, budgetUUID, groceriesUUID)
+	is.NoErr(err)
+	_, err = conn.Exec(ctx, `select api.budget_money($1, $2, 80000, 'Entertainment budget', '2025-03-01')`, budgetUUID, entertainmentUUID)
+	is.NoErr(err)
+
+	t.Run("MoveBetweenCategories", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select api.move_money($1, $2, $3, 20000, 'Need more for groceries', '2025-03-15')
+		`, budgetUUID, entertainmentUUID, groceriesUUID).Scan(&txUUID)
+		is.NoErr(err)
+		is.True(len(txUUID) == 8)
+	})
+
+	t.Run("SourceBalanceDecreases", func(t *testing.T) {
+		is := is_.New(t)
+
+		// entertainment started at 80000, moved 20000 out
+		var balance int64
+		err := conn.QueryRow(ctx, `select api.get_account_balance($1)`, entertainmentUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(60000))
+	})
+
+	t.Run("DestinationBalanceIncreases", func(t *testing.T) {
+		is := is_.New(t)
+
+		// groceries started at 100000, received 20000
+		var balance int64
+		err := conn.QueryRow(ctx, `select api.get_account_balance($1)`, groceriesUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(120000))
+	})
+
+	t.Run("CorrectDebitCredit", func(t *testing.T) {
+		is := is_.New(t)
+
+		var debitUUID, creditUUID string
+		err := conn.QueryRow(ctx, `
+			select
+				(select uuid from data.accounts where id = t.debit_account_id),
+				(select uuid from data.accounts where id = t.credit_account_id)
+			from data.transactions t
+			where t.description = 'Need more for groceries'
+			  and t.user_data = $1
+		`, testUserID).Scan(&debitUUID, &creditUUID)
+		is.NoErr(err)
+		is.Equal(debitUUID, entertainmentUUID) // debit = source (decreases)
+		is.Equal(creditUUID, groceriesUUID)    // credit = destination (increases)
+	})
+
+	t.Run("DescriptionIsOptional", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select api.move_money($1, $2, $3, 5000)
+		`, budgetUUID, entertainmentUUID, groceriesUUID).Scan(&txUUID)
+		is.NoErr(err)
+		is.True(len(txUUID) == 8)
+	})
+
+	t.Run("DefaultDateIsToday", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select api.move_money($1, $2, $3, 1000, 'Small move')
+		`, budgetUUID, groceriesUUID, entertainmentUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		var txDate time.Time
+		err = conn.QueryRow(ctx, `select date from data.transactions where uuid = $1`, txUUID).Scan(&txDate)
+		is.NoErr(err)
+
+		now := time.Now()
+		is.Equal(txDate.Year(), now.Year())
+		is.Equal(txDate.Month(), now.Month())
+		is.Equal(txDate.Day(), now.Day())
+	})
+
+	t.Run("RejectSameCategory", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.move_money($1, $2, $2, 1000, 'Self move')
+		`, budgetUUID, groceriesUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectZeroAmount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.move_money($1, $2, $3, 0)
+		`, budgetUUID, entertainmentUUID, groceriesUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectNegativeAmount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.move_money($1, $2, $3, -100)
+		`, budgetUUID, entertainmentUUID, groceriesUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectInvalidSourceCategory", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.move_money($1, 'nonexistent', $2, 1000)
+		`, budgetUUID, groceriesUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectInvalidDestCategory", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.move_money($1, $2, 'nonexistent', 1000)
+		`, budgetUUID, groceriesUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectInvalidBudget", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select api.move_money('nonexistent', $1, $2, 1000)
+		`, entertainmentUUID, groceriesUUID)
+		is.True(err != nil)
+	})
+}
