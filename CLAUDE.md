@@ -4,11 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-pgbudget is a PostgreSQL budgeting engine. It uses double-entry accounting internally, but the API speaks budgeting language — income, expenses, categories, transfers. The double-entry mechanics are invisible to consumers.
+pgbudget is two things in one PostgreSQL database:
 
-**Identity:** Engine, not app. No payees, tags, goals, auth, or UI concerns. The `metadata` jsonb column is the escape hatch for consumer apps.
+1. **`ledger` schema** — a generic double-entry accounting engine (TigerBeetle-inspired)
+2. **`budget` schema** — a budgeting application layer (not yet built, planned)
 
-**Immutability:** Transactions are never edited or deleted. Corrections and voids create reversals. The books are always provably correct.
+The ledger layer is complete and handles accounts, transactions, balances, corrections, two-phase transfers, batch inserts, idempotency, and per-account balance constraints. It knows nothing about budgeting.
+
+The budget layer will sit on top, translating budgeting vocabulary (income, expenses, categories) into ledger operations (debits, credits, accounts).
 
 ## Development Commands
 
@@ -17,7 +20,6 @@ pgbudget is a PostgreSQL budgeting engine. It uses double-entry accounting inter
 task migrate:up          # Run all pending migrations
 task migrate:up-one      # Run one migration
 task migrate:down        # Rollback last migration
-task migrate:drop        # Drop all migrations
 task migrate:status      # Show migration status
 task migrate:new -- name # Create new migration
 ```
@@ -32,50 +34,55 @@ Tests require Docker via Colima. The `.envrc` sets `DOCKER_HOST` and `TESTCONTAI
 
 ## Architecture
 
-### Three-schema design
-- **`data`**: Tables, constraints, RLS policies. Accounting vocabulary is fine here.
-- **`utils`**: Internal business logic. Accounting vocabulary (debit/credit, asset/liability). `SECURITY DEFINER`.
-- **`api`**: Public interface. **Budgeting vocabulary only** (budget, income, expense, category, transfer, void, correct).
+### Four-schema design
+- **`data`**: Tables, constraints, RLS policies, indexes
+- **`utils`**: Internal helpers (validation, user context, fast/checked write paths)
+- **`ledger`**: Generic double-entry API (accounts, transactions, balances)
+- **`budget`**: Budgeting application layer (not yet built — calls `ledger.*`)
+- **`api`**: Legacy functions (will be removed)
 
-### API vocabulary mapping
+### Ledger API (complete)
 
-| API (public) | Internal (utils/data) |
-|---|---|
-| Budget | Ledger |
-| `bank`, `credit_card`, `cash` | `asset`, `liability` |
-| Category | Equity account |
-| `record_income` | inflow transaction |
-| `record_expense` | outflow transaction |
-| `budget_money` | assign_to_category |
-| `move_money` | category-to-category transfer |
-| `transfer` | account-to-account transfer |
-| `void` | delete_transaction (reversal) |
-| `correct` | correct_transaction (reversal + new) |
-
-### New API functions (v0.1.0 in progress)
 ```sql
-api.create_budget(name, description?)              -- returns uuid
-api.add_account(budget, name, type, description?)  -- type: bank/credit_card/cash/asset/liability
-api.add_category(budget, name)                     -- existing, unchanged
-api.record_income(budget, account, amount, desc, date?)
-api.record_expense(budget, account, amount, category?, desc, date?)
-api.budget_money(budget, category, amount, desc?, date?)
-api.move_money(budget, from_cat, to_cat, amount, desc?, date?)
-api.transfer(budget, from_acct, to_acct, amount, desc?, date?)  -- not yet implemented
-api.void(transaction, reason?)                                    -- not yet implemented
-api.correct(transaction, ...changed_fields, reason?)              -- not yet implemented
+-- setup
+ledger.create_ledger(name, description?)
+ledger.create_account(ledger, name, type, description?,
+    debits_must_not_exceed_credits?, credits_must_not_exceed_debits?)
+
+-- core transaction primitive
+ledger.post_transaction(ledger, debit, credit, amount, date?, description?, idempotency_key?)
+ledger.post_transactions(ledger, jsonb_array)  -- batch
+
+-- two-phase transfers
+ledger.reserve(ledger, debit, credit, amount, timeout_seconds?, date?, description?, idempotency_key?)
+ledger.commit(transaction, amount?)            -- partial commits supported
+ledger.release(transaction)                    -- void pending hold
+ledger.expire_pending()                        -- cleanup timed-out holds
+
+-- corrections (immutable — creates reversals)
+ledger.void(transaction, reason?)
+ledger.correct(transaction, debit?, credit?, amount?, description?, date?, reason?)
+
+-- queries
+ledger.get_balance(account)                    -- reads from account counters
+ledger.get_balances(ledger)                    -- all accounts in ledger
+ledger.get_history(account)                    -- transaction history with running balance
 ```
 
-### Legacy API (still works, will be deprecated)
-```sql
-INSERT INTO api.ledgers (name) VALUES (...)
-INSERT INTO api.accounts (ledger_uuid, name, type) VALUES (...)
-INSERT INTO api.transactions (...)  -- via INSTEAD OF INSERT trigger
-api.add_transaction(ledger, date, desc, type, amount, account, category?)
-api.assign_to_category(ledger, date, desc, amount, category)
-api.correct_transaction(...)
-api.delete_transaction(...)
-```
+### Key design decisions
+
+- **No triggers for balances.** `ledger.post_transaction()` does INSERT + UPDATE counters + INSERT history in one function. Two internal paths: `utils.post_transaction_fast()` (no constraint checks) and `utils.post_transaction_checked()` (conditional UPDATE with constraint enforcement).
+- **Immutable transactions.** INSERT only. Void/correct create reversals. No UPDATE/DELETE on transaction rows.
+- **Balance constraints.** Per-account flags: `debits_must_not_exceed_credits` and `credits_must_not_exceed_debits`. Checked path uses conditional UPDATE. Pending holds count against constraints.
+- **Pending state in `data.pending` table.** Not counters on accounts. Rows exist while hold is active, deleted on resolve. No drift.
+- **Idempotency.** Optional `idempotency_key` on transactions. Partial unique index. Race condition handled via unique_violation catch.
+
+### Balance system
+
+- **Current balance:** `debits_total` / `credits_total` on `data.accounts` (atomic UPDATE, one row read)
+- **Historical balance:** `data.balances` table (append-only, one row per account per transaction)
+- **Pending holds:** `data.pending` table (active holds only, deleted on resolve)
+- **Balance = `debits_total - credits_total`** (asset_like) or **`credits_total - debits_total`** (liability_like/equity)
 
 ## Development Conventions
 
@@ -88,21 +95,23 @@ api.delete_transaction(...)
 - Follow conventions from `/Users/juanolvera/sync/proj/2025-04-24-conventions/src/conventions/postgres/`
 
 ### Function patterns
-- **New API functions**: Simple, return UUID (text). Accept budgeting vocabulary.
-- **Utils functions**: Accept text UUIDs, handle internal logic, return int IDs.
+- **`ledger.*` functions**: Generic double-entry. Take debit/credit account UUIDs directly. No budgeting vocabulary.
+- **`budget.*` functions** (planned): Budgeting vocabulary. Call `ledger.*` internally.
+- **`utils.*` functions**: Internal helpers. Called by `ledger.*`. Not exposed to consumers.
 - **Each step is one commit**: migration + tests. All existing tests stay green.
 
 ### Testing
 - Uses testcontainers (Docker via Colima) for PostgreSQL integration testing
 - Each test function gets its own connection and user context
 - Test user context: `set_config('app.current_user_id', 'user_id', false)`
-- Tests are the reference documentation for how to use the API
 
-## Current plan
+## Planning docs
 
-See `nogit_docs/V1_PLAN.md` for the full v0.1.0 plan.
-
-Steps 1-8 are complete. Remaining: `api.transfer()`, `api.void()`, `api.correct()`, reporting renames, `api.delete_budget()`, deprecation wrappers, test migration, release.
+- `nogit_docs/ARCHITECTURE_V2.md` — full architecture (ledger + budget layers, scale considerations)
+- `nogit_docs/TIGERBEETLE_GAPS.md` — feature comparison with TigerBeetle
+- `nogit_docs/TWO_PHASE_PLAN.md` — two-phase transfer design
+- `nogit_docs/BUDGET_SCHEMA_PLAN.md` — budget layer plan
+- `nogit_docs/REARCHITECTURE_PLAN.md` — migration steps
 
 ## File structure
 

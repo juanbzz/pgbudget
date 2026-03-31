@@ -6013,6 +6013,202 @@ func TestLedgerQueries(t *testing.T) {
 	})
 }
 
+func TestLedgerCRUD(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "ledger_crud_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	t.Run("GetAccounts", func(t *testing.T) {
+		is := is_.New(t)
+
+		var ledgerUUID string
+		err := conn.QueryRow(ctx, `select ledger.create_ledger('Get Accounts Test')`).Scan(&ledgerUUID)
+		is.NoErr(err)
+
+		// create accounts of different types
+		_, err = conn.Exec(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID)
+		is.NoErr(err)
+		_, err = conn.Exec(ctx, `select ledger.create_account($1, 'Visa', 'liability')`, ledgerUUID)
+		is.NoErr(err)
+		_, err = conn.Exec(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID)
+		is.NoErr(err)
+
+		type account struct {
+			UUID        string
+			Name        string
+			Type        string
+			Description *string
+		}
+
+		rows, err := conn.Query(ctx, `select account_uuid, account_name, account_type, description from ledger.get_accounts($1)`, ledgerUUID)
+		is.NoErr(err)
+		defer rows.Close()
+
+		var accounts []account
+		for rows.Next() {
+			var a account
+			err := rows.Scan(&a.UUID, &a.Name, &a.Type, &a.Description)
+			is.NoErr(err)
+			accounts = append(accounts, a)
+		}
+		is.NoErr(rows.Err())
+
+		// should have our 3 + any default accounts from trigger
+		is.True(len(accounts) >= 3)
+
+		// verify our accounts are present
+		names := make(map[string]string)
+		for _, a := range accounts {
+			names[a.Name] = a.Type
+		}
+		is.Equal(names["Checking"], "asset")
+		is.Equal(names["Visa"], "liability")
+		is.Equal(names["Revenue"], "equity")
+	})
+
+	t.Run("GetAccountsRejectsInvalidLedger", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select * from ledger.get_accounts('nonexistent')`)
+		is.True(err != nil)
+	})
+
+	t.Run("DeleteLedger", func(t *testing.T) {
+		is := is_.New(t)
+
+		// create a ledger with accounts and transactions
+		var ledgerUUID, checkingUUID, revenueUUID string
+		err := conn.QueryRow(ctx, `select ledger.create_ledger('To Delete')`).Scan(&ledgerUUID)
+		is.NoErr(err)
+
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+		is.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+		is.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000, '2025-03-01', 'Seed')`, ledgerUUID, checkingUUID, revenueUUID)
+		is.NoErr(err)
+
+		// delete it
+		_, err = conn.Exec(ctx, `select ledger.delete_ledger($1)`, ledgerUUID)
+		is.NoErr(err)
+
+		// verify ledger is gone
+		var count int
+		err = conn.QueryRow(ctx, `select count(*) from data.ledgers where uuid = $1`, ledgerUUID).Scan(&count)
+		is.NoErr(err)
+		is.Equal(count, 0)
+
+		// verify accounts are gone
+		err = conn.QueryRow(ctx, `select count(*) from data.accounts where uuid = $1`, checkingUUID).Scan(&count)
+		is.NoErr(err)
+		is.Equal(count, 0)
+	})
+
+	t.Run("DeleteLedgerRejectsInvalidUUID", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select ledger.delete_ledger('nonexistent')`)
+		is.True(err != nil)
+	})
+
+	t.Run("DeleteLedgerWithPendingHolds", func(t *testing.T) {
+		is := is_.New(t)
+
+		// create ledger with a pending hold
+		var ledgerUUID, checkingUUID, revenueUUID string
+		err := conn.QueryRow(ctx, `select ledger.create_ledger('Delete With Pending')`).Scan(&ledgerUUID)
+		is.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+		is.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+		is.NoErr(err)
+
+		// seed + reserve
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`, ledgerUUID, checkingUUID, revenueUUID)
+		is.NoErr(err)
+		_, err = conn.Exec(ctx, `select ledger.reserve($1, $2, $3, 5000, 300)`, ledgerUUID, checkingUUID, revenueUUID)
+		is.NoErr(err)
+
+		// delete should clean up pending too
+		_, err = conn.Exec(ctx, `select ledger.delete_ledger($1)`, ledgerUUID)
+		is.NoErr(err)
+
+		// verify everything is gone
+		var count int
+		err = conn.QueryRow(ctx, `select count(*) from data.ledgers where uuid = $1`, ledgerUUID).Scan(&count)
+		is.NoErr(err)
+		is.Equal(count, 0)
+	})
+
+	t.Run("RebuildBalances", func(t *testing.T) {
+		is := is_.New(t)
+
+		// create ledger with transactions
+		var ledgerUUID, checkingUUID, revenueUUID string
+		err := conn.QueryRow(ctx, `select ledger.create_ledger('Rebuild Test')`).Scan(&ledgerUUID)
+		is.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+		is.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+		is.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 50000, '2025-03-01', 'First')`, ledgerUUID, checkingUUID, revenueUUID)
+		is.NoErr(err)
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 30000, '2025-03-15', 'Second')`, ledgerUUID, checkingUUID, revenueUUID)
+		is.NoErr(err)
+
+		// verify correct balance before rebuild
+		var balanceBefore int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
+		is.NoErr(err)
+		is.Equal(balanceBefore, int64(80000))
+
+		// manually corrupt the counters
+		_, err = conn.Exec(ctx, `update data.accounts set debits_total = 0, credits_total = 0 where uuid = $1`, checkingUUID)
+		is.NoErr(err)
+
+		// verify balance is now wrong
+		var corruptedBalance int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&corruptedBalance)
+		is.NoErr(err)
+		is.Equal(corruptedBalance, int64(0)) // corrupted
+
+		// rebuild
+		_, err = conn.Exec(ctx, `select ledger.rebuild_balances($1)`, ledgerUUID)
+		is.NoErr(err)
+
+		// verify balance is restored
+		var balanceAfter int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
+		is.NoErr(err)
+		is.Equal(balanceAfter, int64(80000)) // restored
+
+		// verify balance history is correct
+		var historyCount int
+		err = conn.QueryRow(ctx, `
+			select count(*) from data.balances
+			where account_id = (select id from data.accounts where uuid = $1)
+		`, checkingUUID).Scan(&historyCount)
+		is.NoErr(err)
+		is.Equal(historyCount, 2) // one per transaction
+	})
+
+	t.Run("RebuildBalancesRejectsInvalidLedger", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select ledger.rebuild_balances('nonexistent')`)
+		is.True(err != nil)
+	})
+}
+
 func TestTwoPhaseTransfers(t *testing.T) {
 	is := is_.New(t)
 	ctx := context.Background()
