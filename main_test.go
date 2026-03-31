@@ -6013,6 +6013,303 @@ func TestLedgerQueries(t *testing.T) {
 	})
 }
 
+func TestTwoPhaseTransfers(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "two_phase_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	var ledgerUUID, checkingUUID, revenueUUID string
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Two Phase Test')`).Scan(&ledgerUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+	is.NoErr(err)
+
+	// seed with posted balance so we have something to work with
+	_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 100000, '2025-03-01', 'Seed')`, ledgerUUID, checkingUUID, revenueUUID)
+	is.NoErr(err)
+
+	t.Run("ReserveCreatesPendingTransaction", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.reserve($1, $2, $3, 25000, 300, '2025-03-15', 'Hold for payment')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&txUUID)
+		is.NoErr(err)
+		is.True(len(txUUID) == 8)
+
+		// verify status is pending
+		var status string
+		err = conn.QueryRow(ctx, `select status from data.transactions where uuid = $1`, txUUID).Scan(&status)
+		is.NoErr(err)
+		is.Equal(status, "pending")
+
+		// verify pending rows created
+		var pendingCount int
+		err = conn.QueryRow(ctx, `select count(*) from data.pending where transaction_id = (select id from data.transactions where uuid = $1)`, txUUID).Scan(&pendingCount)
+		is.NoErr(err)
+		is.Equal(pendingCount, 2) // one per account
+
+		// verify posted counters NOT updated (still at seed values)
+		var balance int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(100000)) // unchanged
+	})
+
+	t.Run("CommitSettlesPending", func(t *testing.T) {
+		is := is_.New(t)
+
+		// reserve
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.reserve($1, $2, $3, 10000, 300, '2025-03-16', 'To commit')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		// get balance before commit
+		var balanceBefore int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
+		is.NoErr(err)
+
+		// commit
+		var committedUUID string
+		err = conn.QueryRow(ctx, `select ledger.commit($1)`, txUUID).Scan(&committedUUID)
+		is.NoErr(err)
+		is.Equal(committedUUID, txUUID)
+
+		// verify status is posted
+		var status string
+		err = conn.QueryRow(ctx, `select status from data.transactions where uuid = $1`, txUUID).Scan(&status)
+		is.NoErr(err)
+		is.Equal(status, "posted")
+
+		// verify pending rows deleted
+		var pendingCount int
+		err = conn.QueryRow(ctx, `select count(*) from data.pending where transaction_id = (select id from data.transactions where uuid = $1)`, txUUID).Scan(&pendingCount)
+		is.NoErr(err)
+		is.Equal(pendingCount, 0)
+
+		// verify posted balance updated
+		var balanceAfter int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
+		is.NoErr(err)
+		is.Equal(balanceAfter, balanceBefore+10000)
+
+		// verify balance history created
+		var historyCount int
+		err = conn.QueryRow(ctx, `select count(*) from data.balances where transaction_id = (select id from data.transactions where uuid = $1)`, txUUID).Scan(&historyCount)
+		is.NoErr(err)
+		is.Equal(historyCount, 2) // one per account
+	})
+
+	t.Run("ReleaseVoidsPending", func(t *testing.T) {
+		is := is_.New(t)
+
+		// reserve
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.reserve($1, $2, $3, 15000, 300, '2025-03-17', 'To void')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		// get balance before
+		var balanceBefore int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
+		is.NoErr(err)
+
+		// release
+		_, err = conn.Exec(ctx, `select ledger.release($1)`, txUUID)
+		is.NoErr(err)
+
+		// verify status is voided
+		var status string
+		err = conn.QueryRow(ctx, `select status from data.transactions where uuid = $1`, txUUID).Scan(&status)
+		is.NoErr(err)
+		is.Equal(status, "voided")
+
+		// verify pending rows deleted
+		var pendingCount int
+		err = conn.QueryRow(ctx, `select count(*) from data.pending where transaction_id = (select id from data.transactions where uuid = $1)`, txUUID).Scan(&pendingCount)
+		is.NoErr(err)
+		is.Equal(pendingCount, 0)
+
+		// verify balance unchanged
+		var balanceAfter int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
+		is.NoErr(err)
+		is.Equal(balanceBefore, balanceAfter)
+	})
+
+	t.Run("PartialCommit", func(t *testing.T) {
+		is := is_.New(t)
+
+		var balanceBefore int64
+		err := conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
+		is.NoErr(err)
+
+		// reserve 20000
+		var txUUID string
+		err = conn.QueryRow(ctx, `
+			select ledger.reserve($1, $2, $3, 20000, 300, '2025-03-18', 'Partial')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		// commit only 12000
+		_, err = conn.Exec(ctx, `select ledger.commit($1, 12000)`, txUUID)
+		is.NoErr(err)
+
+		// verify amount on transaction is 12000 (not 20000)
+		var amount int64
+		err = conn.QueryRow(ctx, `select amount from data.transactions where uuid = $1`, txUUID).Scan(&amount)
+		is.NoErr(err)
+		is.Equal(amount, int64(12000))
+
+		// balance changed by 12000 (not 20000)
+		var balanceAfter int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
+		is.NoErr(err)
+		is.Equal(balanceAfter, balanceBefore+12000)
+	})
+
+	t.Run("CommitRejectsNonPending", func(t *testing.T) {
+		is := is_.New(t)
+
+		// try to commit a posted transaction
+		var postedUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 100, '2025-03-19', 'Posted')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&postedUUID)
+		is.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.commit($1)`, postedUUID)
+		is.True(err != nil) // not pending
+	})
+
+	t.Run("ReleaseRejectsNonPending", func(t *testing.T) {
+		is := is_.New(t)
+
+		var postedUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 100, '2025-03-19', 'Posted2')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&postedUUID)
+		is.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.release($1)`, postedUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("CommitRejectsExcessAmount", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.reserve($1, $2, $3, 5000, 300, '2025-03-20', 'Excess test')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.commit($1, 5001)`, txUUID)
+		is.True(err != nil) // exceeds reserved amount
+	})
+
+	t.Run("PendingCountsAgainstConstraints", func(t *testing.T) {
+		is := is_.New(t)
+
+		// create constrained account with credits_must_not_exceed_debits
+		var constrainedUUID, otherUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.create_account($1, 'Constrained 2P', 'asset', null, false, true)
+		`, ledgerUUID).Scan(&constrainedUUID)
+		is.NoErr(err)
+
+		err = conn.QueryRow(ctx, `
+			select ledger.create_account($1, 'Other 2P', 'equity')
+		`, ledgerUUID).Scan(&otherUUID)
+		is.NoErr(err)
+
+		// deposit 10000 (debit constrained, credit other)
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 10000, '2025-03-20', 'Deposit')
+		`, ledgerUUID, constrainedUUID, otherUUID)
+		is.NoErr(err)
+
+		// reserve 8000 (credit constrained = hold against available)
+		_, err = conn.Exec(ctx, `
+			select ledger.reserve($1, $2, $3, 8000, 300, '2025-03-20', 'Reserve most')
+		`, ledgerUUID, otherUUID, constrainedUUID)
+		is.NoErr(err)
+
+		// try to reserve 3000 more (8000 pending + 3000 = 11000 > 10000 posted debits)
+		_, err = conn.Exec(ctx, `
+			select ledger.reserve($1, $2, $3, 3000, 300, '2025-03-20', 'Too much')
+		`, ledgerUUID, otherUUID, constrainedUUID)
+		is.True(err != nil) // rejected: pending + new > posted
+	})
+
+	t.Run("ExpirePending", func(t *testing.T) {
+		is := is_.New(t)
+
+		// create a pending with 1-second timeout
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.reserve($1, $2, $3, 1000, 1, '2025-03-21', 'Will expire')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		// wait for expiry
+		time.Sleep(2 * time.Second)
+
+		// expire
+		var count int
+		err = conn.QueryRow(ctx, `select ledger.expire_pending()`).Scan(&count)
+		is.NoErr(err)
+		is.True(count >= 1)
+
+		// verify status is expired
+		var status string
+		err = conn.QueryRow(ctx, `select status from data.transactions where uuid = $1`, txUUID).Scan(&status)
+		is.NoErr(err)
+		is.Equal(status, "expired")
+
+		// verify pending rows cleaned up
+		var pendingCount int
+		err = conn.QueryRow(ctx, `select count(*) from data.pending where transaction_id = (select id from data.transactions where uuid = $1)`, txUUID).Scan(&pendingCount)
+		is.NoErr(err)
+		is.Equal(pendingCount, 0)
+	})
+
+	t.Run("RegularPostUnaffected", func(t *testing.T) {
+		is := is_.New(t)
+
+		// regular post_transaction should still work as before
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 5000, '2025-03-22', 'Regular')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		var status string
+		err = conn.QueryRow(ctx, `select status from data.transactions where uuid = $1`, txUUID).Scan(&status)
+		is.NoErr(err)
+		is.Equal(status, "posted")
+
+		// no pending rows for regular transactions
+		var pendingCount int
+		err = conn.QueryRow(ctx, `select count(*) from data.pending where transaction_id = (select id from data.transactions where uuid = $1)`, txUUID).Scan(&pendingCount)
+		is.NoErr(err)
+		is.Equal(pendingCount, 0)
+	})
+}
+
 func TestIdempotency(t *testing.T) {
 	is := is_.New(t)
 	ctx := context.Background()
