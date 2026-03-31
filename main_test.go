@@ -5354,6 +5354,294 @@ func TestAccountBalanceCounters(t *testing.T) {
 	})
 }
 
+func TestLedger(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "ledger_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	t.Run("SchemaExists", func(t *testing.T) {
+		is := is_.New(t)
+
+		var exists bool
+		err := conn.QueryRow(ctx, `
+			select exists (
+				select 1 from information_schema.schemata where schema_name = 'ledger'
+			)
+		`).Scan(&exists)
+		is.NoErr(err)
+		is.True(exists)
+	})
+
+	// create a ledger for subsequent tests
+	var ledgerUUID string
+
+	t.Run("CreateLedger", func(t *testing.T) {
+		is := is_.New(t)
+
+		err := conn.QueryRow(ctx, `select ledger.create_ledger('Test Ledger')`).Scan(&ledgerUUID)
+		is.NoErr(err)
+		is.True(len(ledgerUUID) == 8)
+	})
+
+	t.Run("CreateLedgerWithDescription", func(t *testing.T) {
+		is := is_.New(t)
+
+		var uuid string
+		err := conn.QueryRow(ctx, `select ledger.create_ledger('Described Ledger', 'A test ledger')`).Scan(&uuid)
+		is.NoErr(err)
+
+		var desc *string
+		err = conn.QueryRow(ctx, `select description from data.ledgers where uuid = $1`, uuid).Scan(&desc)
+		is.NoErr(err)
+		is.True(desc != nil)
+		is.Equal(*desc, "A test ledger")
+	})
+
+	t.Run("CreateLedgerRejectsEmptyName", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select ledger.create_ledger('')`)
+		is.True(err != nil)
+
+		_, err = conn.Exec(ctx, `select ledger.create_ledger('   ')`)
+		is.True(err != nil)
+	})
+
+	// create accounts for transaction tests
+	var checkingUUID, savingsUUID, visaUUID, incomeUUID string
+
+	t.Run("CreateAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+		is.NoErr(err)
+		is.True(len(checkingUUID) == 8)
+
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Savings', 'asset')`, ledgerUUID).Scan(&savingsUUID)
+		is.NoErr(err)
+
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Visa', 'liability')`, ledgerUUID).Scan(&visaUUID)
+		is.NoErr(err)
+
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&incomeUUID)
+		is.NoErr(err)
+	})
+
+	t.Run("CreateAccountValidatesType", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select ledger.create_account($1, 'Bad', 'revenue')`, ledgerUUID)
+		is.True(err != nil)
+
+		_, err = conn.Exec(ctx, `select ledger.create_account($1, 'Bad', 'expense')`, ledgerUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("CreateAccountRejectsEmptyName", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select ledger.create_account($1, '', 'asset')`, ledgerUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("CreateAccountRejectsInvalidLedger", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select ledger.create_account('nonexistent', 'Checking', 'asset')`)
+		is.True(err != nil)
+	})
+
+	// post_transaction tests
+	t.Run("PostTransaction", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 100000, '2025-03-15', 'Paycheck')
+		`, ledgerUUID, checkingUUID, incomeUUID).Scan(&txUUID)
+		is.NoErr(err)
+		is.True(len(txUUID) == 8)
+	})
+
+	t.Run("PostTransactionUpdatesCounters", func(t *testing.T) {
+		is := is_.New(t)
+
+		// checking was debited 100000
+		var debits, credits int64
+		err := conn.QueryRow(ctx, `
+			select debits_total, credits_total from data.accounts where uuid = $1
+		`, checkingUUID).Scan(&debits, &credits)
+		is.NoErr(err)
+		is.Equal(debits, int64(100000))
+		is.Equal(credits, int64(0))
+
+		// income was credited 100000
+		err = conn.QueryRow(ctx, `
+			select debits_total, credits_total from data.accounts where uuid = $1
+		`, incomeUUID).Scan(&debits, &credits)
+		is.NoErr(err)
+		is.Equal(debits, int64(0))
+		is.Equal(credits, int64(100000))
+	})
+
+	t.Run("PostTransactionCreatesBalanceHistory", func(t *testing.T) {
+		is := is_.New(t)
+
+		// should have balance history entries for both accounts
+		var count int
+		err := conn.QueryRow(ctx, `
+			select count(*) from data.balances
+			where user_data = $1
+		`, testUserID).Scan(&count)
+		is.NoErr(err)
+		is.Equal(count, 2) // one for debit account, one for credit account
+	})
+
+	t.Run("PostTransactionBalanceHistoryIsCorrect", func(t *testing.T) {
+		is := is_.New(t)
+
+		// checking: debits_total=100000, credits_total=0
+		var debits, credits int64
+		err := conn.QueryRow(ctx, `
+			select debits_total, credits_total from data.balances
+			where account_id = (select id from data.accounts where uuid = $1)
+			order by transaction_id desc limit 1
+		`, checkingUUID).Scan(&debits, &credits)
+		is.NoErr(err)
+		is.Equal(debits, int64(100000))
+		is.Equal(credits, int64(0))
+	})
+
+	t.Run("PostMultipleTransactions", func(t *testing.T) {
+		is := is_.New(t)
+
+		// spend from checking to visa (simulating a payment)
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 25000, '2025-03-16', 'Visa payment')
+		`, ledgerUUID, visaUUID, checkingUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		// checking: debited 100000 (paycheck), credited 25000 (visa payment)
+		var debits, credits int64
+		err = conn.QueryRow(ctx, `
+			select debits_total, credits_total from data.accounts where uuid = $1
+		`, checkingUUID).Scan(&debits, &credits)
+		is.NoErr(err)
+		is.Equal(debits, int64(100000))
+		is.Equal(credits, int64(25000))
+
+		// visa: debited 25000
+		err = conn.QueryRow(ctx, `
+			select debits_total, credits_total from data.accounts where uuid = $1
+		`, visaUUID).Scan(&debits, &credits)
+		is.NoErr(err)
+		is.Equal(debits, int64(25000))
+		is.Equal(credits, int64(0))
+	})
+
+	t.Run("BalanceFromCounters", func(t *testing.T) {
+		is := is_.New(t)
+
+		// checking: asset_like → balance = debits - credits = 100000 - 25000 = 75000
+		var balance int64
+		err := conn.QueryRow(ctx, `select api.get_account_balance($1)`, checkingUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(75000))
+
+		// income: equity → balance = credits - debits = 100000 - 0 = 100000
+		err = conn.QueryRow(ctx, `select api.get_account_balance($1)`, incomeUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(100000))
+
+		// visa: liability_like → balance = credits - debits = 0 - 25000 = -25000
+		err = conn.QueryRow(ctx, `select api.get_account_balance($1)`, visaUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(-25000))
+	})
+
+	t.Run("PostTransactionRejectsZeroAmount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 0, '2025-03-15', 'Zero')
+		`, ledgerUUID, checkingUUID, incomeUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("PostTransactionRejectsNegativeAmount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, -100, '2025-03-15', 'Negative')
+		`, ledgerUUID, checkingUUID, incomeUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("PostTransactionRejectsSameAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $2, 100, '2025-03-15', 'Self')
+		`, ledgerUUID, checkingUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("PostTransactionRejectsInvalidDebit", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.post_transaction($1, 'nonexistent', $2, 100, '2025-03-15', 'Bad')
+		`, ledgerUUID, incomeUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("PostTransactionRejectsInvalidCredit", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, 'nonexistent', 100, '2025-03-15', 'Bad')
+		`, ledgerUUID, checkingUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("PostTransactionRejectsInvalidLedger", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.post_transaction('nonexistent', $1, $2, 100, '2025-03-15', 'Bad')
+		`, checkingUUID, incomeUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("PostTransactionDefaultDate", func(t *testing.T) {
+		is := is_.New(t)
+
+		// omit the date parameter to use the default (current_date)
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 500)
+		`, ledgerUUID, checkingUUID, incomeUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		var txDate time.Time
+		err = conn.QueryRow(ctx, `select date from data.transactions where uuid = $1`, txUUID).Scan(&txDate)
+		is.NoErr(err)
+
+		now := time.Now()
+		is.Equal(txDate.Year(), now.Year())
+		is.Equal(txDate.Month(), now.Month())
+		is.Equal(txDate.Day(), now.Day())
+	})
+}
+
 func TestBalancesTable(t *testing.T) {
 	is := is_.New(t)
 	ctx := context.Background()
