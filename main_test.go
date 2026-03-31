@@ -6013,6 +6013,210 @@ func TestLedgerQueries(t *testing.T) {
 	})
 }
 
+func TestBalanceConstraints(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "constraints_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	var ledgerUUID string
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Constraints Test')`).Scan(&ledgerUUID)
+	is.NoErr(err)
+
+	t.Run("AssetNoOverdraft", func(t *testing.T) {
+		is := is_.New(t)
+
+		// create asset account with credits_must_not_exceed_debits (can't spend more than you have)
+		var checkingUUID, revenueUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.create_account($1, 'No Overdraft Checking', 'asset',
+				null, false, true)
+		`, ledgerUUID).Scan(&checkingUUID)
+		is.NoErr(err)
+
+		err = conn.QueryRow(ctx, `
+			select ledger.create_account($1, 'Revenue A', 'equity')
+		`, ledgerUUID).Scan(&revenueUUID)
+		is.NoErr(err)
+
+		// deposit 10000 (debit checking, credit revenue) — checking debits increase, fine
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 10000, '2025-03-01', 'Deposit')
+		`, ledgerUUID, checkingUUID, revenueUUID)
+		is.NoErr(err)
+
+		// spend exactly 10000 (debit revenue, credit checking) — checking credits = debits, fine
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 10000, '2025-03-02', 'Spend all')
+		`, ledgerUUID, revenueUUID, checkingUUID)
+		is.NoErr(err)
+
+		// try to spend 1 more — should fail (credits would exceed debits)
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 1, '2025-03-03', 'Overdraft')
+		`, ledgerUUID, revenueUUID, checkingUUID)
+		is.True(err != nil) // rejected: would exceed debit balance
+	})
+
+	t.Run("EquityNoOverspend", func(t *testing.T) {
+		is := is_.New(t)
+
+		// create equity account with debits_must_not_exceed_credits (can't withdraw more than funded)
+		var categoryUUID, fundingUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.create_account($1, 'Capped Category', 'equity',
+				null, true, false)
+		`, ledgerUUID).Scan(&categoryUUID)
+		is.NoErr(err)
+
+		err = conn.QueryRow(ctx, `
+			select ledger.create_account($1, 'Funding Source', 'equity')
+		`, ledgerUUID).Scan(&fundingUUID)
+		is.NoErr(err)
+
+		// fund category: 5000 (debit funding, credit category) — category credits increase
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 5000, '2025-03-01', 'Fund')
+		`, ledgerUUID, fundingUUID, categoryUUID)
+		is.NoErr(err)
+
+		// withdraw exactly 5000 (debit category, credit funding) — category debits = credits
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 5000, '2025-03-02', 'Withdraw all')
+		`, ledgerUUID, categoryUUID, fundingUUID)
+		is.NoErr(err)
+
+		// try to withdraw 1 more — should fail
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 1, '2025-03-03', 'Overspend')
+		`, ledgerUUID, categoryUUID, fundingUUID)
+		is.True(err != nil) // rejected: would exceed credit balance
+	})
+
+	t.Run("DefaultNoConstraints", func(t *testing.T) {
+		is := is_.New(t)
+
+		// default account: no constraints, negative balance allowed
+		var acctUUID, otherUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.create_account($1, 'Unconstrained', 'asset')
+		`, ledgerUUID).Scan(&acctUUID)
+		is.NoErr(err)
+
+		err = conn.QueryRow(ctx, `
+			select ledger.create_account($1, 'Other', 'equity')
+		`, ledgerUUID).Scan(&otherUUID)
+		is.NoErr(err)
+
+		// credit without any prior debit — negative balance, but allowed
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 99999, '2025-03-01', 'Go negative')
+		`, ledgerUUID, otherUUID, acctUUID)
+		is.NoErr(err)
+
+		// balance is -99999 for asset (debits 0 - credits 99999)
+		var balance int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, acctUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(-99999))
+	})
+
+	t.Run("ConstraintOnlyAffectsConstrainedAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		// constrained account paired with unconstrained account
+		// the unconstrained side should not be affected
+		var constrainedUUID, freeUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.create_account($1, 'Constrained Acct', 'equity', null, true, false)
+		`, ledgerUUID).Scan(&constrainedUUID)
+		is.NoErr(err)
+
+		err = conn.QueryRow(ctx, `
+			select ledger.create_account($1, 'Free Acct', 'equity')
+		`, ledgerUUID).Scan(&freeUUID)
+		is.NoErr(err)
+
+		// try to debit constrained account without any credits — should fail
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 100, '2025-03-01', 'Should fail')
+		`, ledgerUUID, constrainedUUID, freeUUID)
+		is.True(err != nil) // constrained: debits would exceed credits (0)
+
+		// reverse direction: credit constrained, debit free — should work
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 100, '2025-03-01', 'Should work')
+		`, ledgerUUID, freeUUID, constrainedUUID)
+		is.NoErr(err)
+	})
+
+	t.Run("FastPathStillWorks", func(t *testing.T) {
+		is := is_.New(t)
+
+		// two unconstrained accounts — should use fast path
+		var aUUID, bUUID string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Fast A', 'asset')`, ledgerUUID).Scan(&aUUID)
+		is.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Fast B', 'equity')`, ledgerUUID).Scan(&bUUID)
+		is.NoErr(err)
+
+		var txUUID string
+		err = conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 50000, '2025-03-01', 'Fast path')
+		`, ledgerUUID, aUUID, bUUID).Scan(&txUUID)
+		is.NoErr(err)
+		is.True(len(txUUID) == 8)
+
+		// verify counters and balance history still work
+		var balance int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, aUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(50000))
+	})
+
+	t.Run("BatchRespectsConstraints", func(t *testing.T) {
+		is := is_.New(t)
+
+		var cappedUUID, sourceUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.create_account($1, 'Batch Capped', 'equity', null, true, false)
+		`, ledgerUUID).Scan(&cappedUUID)
+		is.NoErr(err)
+
+		err = conn.QueryRow(ctx, `
+			select ledger.create_account($1, 'Batch Source', 'equity')
+		`, ledgerUUID).Scan(&sourceUUID)
+		is.NoErr(err)
+
+		// fund 1000
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 1000, '2025-03-01', 'Fund')
+		`, ledgerUUID, sourceUUID, cappedUUID)
+		is.NoErr(err)
+
+		// batch: first withdraws 500 (ok), second withdraws 600 (would exceed) — whole batch fails
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transactions($1, $2::jsonb)
+		`, ledgerUUID, fmt.Sprintf(`[
+			{"debit": "%s", "credit": "%s", "amount": 500, "description": "OK"},
+			{"debit": "%s", "credit": "%s", "amount": 600, "description": "Too much"}
+		]`, cappedUUID, sourceUUID, cappedUUID, sourceUUID))
+		is.True(err != nil) // whole batch rejected
+
+		// balance unchanged — atomic rollback
+		var balance int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, cappedUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(1000)) // unchanged
+	})
+}
+
 func TestPostTransactions(t *testing.T) {
 	is := is_.New(t)
 	ctx := context.Background()
