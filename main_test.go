@@ -5817,6 +5817,202 @@ func TestLedger(t *testing.T) {
 	})
 }
 
+func TestLedgerQueries(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "ledger_queries_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	// set up ledger with accounts and transactions
+	var ledgerUUID, checkingUUID, savingsUUID, revenueUUID string
+
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Query Test Ledger')`).Scan(&ledgerUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Savings', 'asset')`, ledgerUUID).Scan(&savingsUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+	is.NoErr(err)
+
+	// post some transactions
+	// 1. income: debit checking 100000, credit revenue
+	_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 100000, '2025-03-01', 'Paycheck')`, ledgerUUID, checkingUUID, revenueUUID)
+	is.NoErr(err)
+	// 2. transfer: debit savings 30000, credit checking (move to savings)
+	_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 30000, '2025-03-05', 'To savings')`, ledgerUUID, savingsUUID, checkingUUID)
+	is.NoErr(err)
+	// 3. another income: debit checking 50000, credit revenue
+	_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 50000, '2025-03-15', 'Freelance')`, ledgerUUID, checkingUUID, revenueUUID)
+	is.NoErr(err)
+
+	t.Run("GetBalance", func(t *testing.T) {
+		is := is_.New(t)
+
+		// checking: debits 150000, credits 30000 → balance 120000
+		var balance int64
+		err := conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(120000))
+
+		// savings: debits 30000, credits 0 → balance 30000
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, savingsUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(30000))
+
+		// revenue: equity → credits 150000, debits 0 → balance 150000
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, revenueUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(150000))
+	})
+
+	t.Run("GetBalanceRejectsInvalidAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select ledger.get_balance('nonexistent')`)
+		is.True(err != nil)
+	})
+
+	t.Run("GetBalances", func(t *testing.T) {
+		is := is_.New(t)
+
+		type accountBalance struct {
+			UUID    string
+			Name    string
+			Type    string
+			Balance int64
+		}
+
+		rows, err := conn.Query(ctx, `select * from ledger.get_balances($1)`, ledgerUUID)
+		is.NoErr(err)
+		defer rows.Close()
+
+		var balances []accountBalance
+		for rows.Next() {
+			var ab accountBalance
+			err := rows.Scan(&ab.UUID, &ab.Name, &ab.Type, &ab.Balance)
+			is.NoErr(err)
+			balances = append(balances, ab)
+		}
+		is.NoErr(rows.Err())
+
+		// should have at least our 3 accounts (plus any default accounts from trigger)
+		is.True(len(balances) >= 3)
+
+		// find our accounts and verify balances
+		var foundChecking, foundSavings, foundRevenue bool
+		for _, ab := range balances {
+			switch ab.UUID {
+			case checkingUUID:
+				is.Equal(ab.Balance, int64(120000))
+				is.Equal(ab.Type, "asset")
+				foundChecking = true
+			case savingsUUID:
+				is.Equal(ab.Balance, int64(30000))
+				is.Equal(ab.Type, "asset")
+				foundSavings = true
+			case revenueUUID:
+				is.Equal(ab.Balance, int64(150000))
+				is.Equal(ab.Type, "equity")
+				foundRevenue = true
+			}
+		}
+		is.True(foundChecking)
+		is.True(foundSavings)
+		is.True(foundRevenue)
+	})
+
+	t.Run("GetBalancesRejectsInvalidLedger", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select * from ledger.get_balances('nonexistent')`)
+		is.True(err != nil)
+	})
+
+	t.Run("GetHistory", func(t *testing.T) {
+		is := is_.New(t)
+
+		type historyRow struct {
+			TxUUID         string
+			Date           time.Time
+			Description    string
+			Counterparty   string
+			Amount         int64
+			Direction      string
+			RunningBalance int64
+		}
+
+		rows, err := conn.Query(ctx, `select * from ledger.get_history($1)`, checkingUUID)
+		is.NoErr(err)
+		defer rows.Close()
+
+		var history []historyRow
+		for rows.Next() {
+			var h historyRow
+			err := rows.Scan(&h.TxUUID, &h.Date, &h.Description, &h.Counterparty, &h.Amount, &h.Direction, &h.RunningBalance)
+			is.NoErr(err)
+			history = append(history, h)
+		}
+		is.NoErr(rows.Err())
+
+		// checking has 3 transactions, newest first
+		is.Equal(len(history), 3)
+
+		// most recent: Freelance (debit checking 50000)
+		is.Equal(history[0].Description, "Freelance")
+		is.Equal(history[0].Amount, int64(50000))
+		is.Equal(history[0].Direction, "debit")
+		is.Equal(history[0].RunningBalance, int64(120000)) // 100000 - 30000 + 50000
+
+		// middle: To savings (credit checking 30000)
+		is.Equal(history[1].Description, "To savings")
+		is.Equal(history[1].Amount, int64(30000))
+		is.Equal(history[1].Direction, "credit")
+		is.Equal(history[1].RunningBalance, int64(70000)) // 100000 - 30000
+
+		// oldest: Paycheck (debit checking 100000)
+		is.Equal(history[2].Description, "Paycheck")
+		is.Equal(history[2].Amount, int64(100000))
+		is.Equal(history[2].Direction, "debit")
+		is.Equal(history[2].RunningBalance, int64(100000))
+	})
+
+	t.Run("GetHistoryCounterparty", func(t *testing.T) {
+		is := is_.New(t)
+
+		rows, err := conn.Query(ctx, `select counterparty from ledger.get_history($1)`, checkingUUID)
+		is.NoErr(err)
+		defer rows.Close()
+
+		var counterparties []string
+		for rows.Next() {
+			var cp string
+			err := rows.Scan(&cp)
+			is.NoErr(err)
+			counterparties = append(counterparties, cp)
+		}
+		is.NoErr(rows.Err())
+
+		// counterparty is the other account in each transaction
+		is.Equal(counterparties[0], "Revenue")  // Freelance: debit checking, credit revenue
+		is.Equal(counterparties[1], "Savings")   // To savings: debit savings, credit checking
+		is.Equal(counterparties[2], "Revenue")   // Paycheck: debit checking, credit revenue
+	})
+
+	t.Run("GetHistoryRejectsInvalidAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select * from ledger.get_history('nonexistent')`)
+		is.True(err != nil)
+	})
+}
+
 func TestBalancesTable(t *testing.T) {
 	is := is_.New(t)
 	ctx := context.Background()
