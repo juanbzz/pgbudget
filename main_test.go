@@ -6015,6 +6015,189 @@ func TestLedgerQueries(t *testing.T) {
 	})
 }
 
+func TestLinkedTransfers(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "linked_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	var ledgerUUID string
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Linked Test')`).Scan(&ledgerUUID)
+	is.NoErr(err)
+
+	// get the auto-created clearing account
+	var clearingUUID string
+	err = conn.QueryRow(ctx, `
+		select account_uuid from ledger.get_accounts($1, true)
+		where visibility = 'internal' and account_name = 'clearing'
+	`, ledgerUUID).Scan(&clearingUUID)
+	is.NoErr(err)
+
+	// create user accounts
+	var checkingUUID, visaUUID, revenueUUID string
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Visa', 'liability')`, ledgerUUID).Scan(&visaUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+	is.NoErr(err)
+
+	// seed checking with balance
+	_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 500000, '2025-03-01', 'Seed')`, ledgerUUID, checkingUUID, revenueUUID)
+	is.NoErr(err)
+
+	t.Run("ClearingAccountAutoCreated", func(t *testing.T) {
+		is := is_.New(t)
+
+		is.True(len(clearingUUID) == 8)
+
+		// clearing account should NOT show in default get_accounts
+		var count int
+		err := conn.QueryRow(ctx, `
+			select count(*) from ledger.get_accounts($1)
+			where account_name = 'clearing'
+		`, ledgerUUID).Scan(&count)
+		is.NoErr(err)
+		is.Equal(count, 0) // hidden by default
+
+		// but should show with include_internal
+		err = conn.QueryRow(ctx, `
+			select count(*) from ledger.get_accounts($1, true)
+			where account_name = 'clearing'
+		`, ledgerUUID).Scan(&count)
+		is.NoErr(err)
+		is.Equal(count, 1)
+	})
+
+	t.Run("PostLinkedCreditCardPayment", func(t *testing.T) {
+		is := is_.New(t)
+
+		var uuids []string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_linked($1, $2::jsonb)
+		`, ledgerUUID, fmt.Sprintf(`[
+			{"debit": "%s", "credit": "%s", "amount": 50000, "date": "2025-03-28", "description": "VISA PAYMENT"},
+			{"debit": "%s", "credit": "%s", "amount": 50000, "date": "2025-03-30", "description": "PAYMENT RECEIVED"}
+		]`, clearingUUID, checkingUUID, visaUUID, clearingUUID)).Scan(&uuids)
+		is.NoErr(err)
+		is.Equal(len(uuids), 2)
+
+		// verify both share the same link_id
+		var link1, link2 *int64
+		err = conn.QueryRow(ctx, `select link_id from data.transactions where uuid = $1`, uuids[0]).Scan(&link1)
+		is.NoErr(err)
+		err = conn.QueryRow(ctx, `select link_id from data.transactions where uuid = $1`, uuids[1]).Scan(&link2)
+		is.NoErr(err)
+		is.True(link1 != nil)
+		is.True(link2 != nil)
+		is.Equal(*link1, *link2) // same link_id
+	})
+
+	t.Run("ClearingAccountNetsToZero", func(t *testing.T) {
+		is := is_.New(t)
+
+		var balance int64
+		err := conn.QueryRow(ctx, `select ledger.get_balance($1)`, clearingUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(0)) // clearing always nets to zero
+	})
+
+	t.Run("GetHistoryResolvesCounterparty", func(t *testing.T) {
+		is := is_.New(t)
+
+		// checking history should show Visa as counterparty, not Clearing
+		var counterparty string
+		err := conn.QueryRow(ctx, `
+			select counterparty from ledger.get_history($1)
+			where description = 'VISA PAYMENT'
+		`, checkingUUID).Scan(&counterparty)
+		is.NoErr(err)
+		is.Equal(counterparty, "Visa") // resolved through clearing
+
+		// visa history should show Checking as counterparty
+		err = conn.QueryRow(ctx, `
+			select counterparty from ledger.get_history($1)
+			where description = 'PAYMENT RECEIVED'
+		`, visaUUID).Scan(&counterparty)
+		is.NoErr(err)
+		is.Equal(counterparty, "Checking") // resolved through clearing
+	})
+
+	t.Run("GetHistoryShowsCorrectDatesPerSide", func(t *testing.T) {
+		is := is_.New(t)
+
+		// checking should show March 28
+		var checkingDate time.Time
+		err := conn.QueryRow(ctx, `
+			select date from ledger.get_history($1)
+			where description = 'VISA PAYMENT'
+		`, checkingUUID).Scan(&checkingDate)
+		is.NoErr(err)
+		is.Equal(checkingDate.Day(), 28)
+
+		// visa should show March 30
+		var visaDate time.Time
+		err = conn.QueryRow(ctx, `
+			select date from ledger.get_history($1)
+			where description = 'PAYMENT RECEIVED'
+		`, visaUUID).Scan(&visaDate)
+		is.NoErr(err)
+		is.Equal(visaDate.Day(), 30)
+	})
+
+	t.Run("LinkedIsAtomic", func(t *testing.T) {
+		is := is_.New(t)
+
+		// second entry has invalid account — whole batch should fail
+		_, err := conn.Exec(ctx, `
+			select ledger.post_linked($1, $2::jsonb)
+		`, ledgerUUID, fmt.Sprintf(`[
+			{"debit": "%s", "credit": "%s", "amount": 1000, "description": "Good"},
+			{"debit": "nonexistent", "credit": "%s", "amount": 1000, "description": "Bad"}
+		]`, clearingUUID, checkingUUID, clearingUUID))
+		is.True(err != nil)
+	})
+
+	t.Run("LinkedRequiresAtLeastTwo", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.post_linked($1, $2::jsonb)
+		`, ledgerUUID, fmt.Sprintf(`[
+			{"debit": "%s", "credit": "%s", "amount": 1000}
+		]`, clearingUUID, checkingUUID))
+		is.True(err != nil) // needs at least 2
+	})
+
+	t.Run("LinkedWithThreeLegs", func(t *testing.T) {
+		is := is_.New(t)
+
+		// split payment: checking pays $300, visa pays $200, total $500 to revenue
+		var uuids []string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_linked($1, $2::jsonb)
+		`, ledgerUUID, fmt.Sprintf(`[
+			{"debit": "%s", "credit": "%s", "amount": 30000, "date": "2025-04-01", "description": "Checking portion"},
+			{"debit": "%s", "credit": "%s", "amount": 20000, "date": "2025-04-01", "description": "Visa portion"},
+			{"debit": "%s", "credit": "%s", "amount": 50000, "date": "2025-04-01", "description": "Total to revenue"}
+		]`, clearingUUID, checkingUUID, clearingUUID, visaUUID, revenueUUID, clearingUUID)).Scan(&uuids)
+		is.NoErr(err)
+		is.Equal(len(uuids), 3)
+
+		// clearing still nets to zero (credited 30000+20000, debited 50000)
+		var balance int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, clearingUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(0))
+	})
+}
+
 func TestAccountClosing(t *testing.T) {
 	is := is_.New(t)
 	ctx := context.Background()

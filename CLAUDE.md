@@ -41,17 +41,20 @@ Tests require Docker via Colima. The `.envrc` sets `DOCKER_HOST` and `TESTCONTAI
 - **`budget`**: Budgeting application layer (not yet built — calls `ledger.*`)
 - **`api`**: Legacy functions (will be removed)
 
-### Ledger API (complete)
+### Ledger API (complete — 18 functions)
 
 ```sql
 -- setup
-ledger.create_ledger(name, description?)
+ledger.create_ledger(name, description?)       -- auto-creates internal 'clearing' account
 ledger.create_account(ledger, name, type, description?,
     debits_must_not_exceed_credits?, credits_must_not_exceed_debits?)
+ledger.close_account(account)                  -- permanent, rejects new transactions
+ledger.delete_ledger(ledger)                   -- CASCADE with cleanup
 
 -- core transaction primitive
 ledger.post_transaction(ledger, debit, credit, amount, date?, description?, idempotency_key?)
 ledger.post_transactions(ledger, jsonb_array)  -- batch
+ledger.post_linked(ledger, jsonb_array)        -- multi-leg with clearing account
 
 -- two-phase transfers
 ledger.reserve(ledger, debit, credit, amount, timeout_seconds?, date?, description?, idempotency_key?)
@@ -60,13 +63,15 @@ ledger.release(transaction)                    -- void pending hold
 ledger.expire_pending()                        -- cleanup timed-out holds
 
 -- corrections (immutable — creates reversals)
-ledger.void(transaction, reason?)
+ledger.void(transaction, reason?)              -- allowed on closed accounts
 ledger.correct(transaction, debit?, credit?, amount?, description?, date?, reason?)
 
 -- queries
 ledger.get_balance(account)                    -- reads from account counters
 ledger.get_balances(ledger)                    -- all accounts in ledger
-ledger.get_history(account)                    -- transaction history with running balance
+ledger.get_accounts(ledger, include_internal?) -- account list with visibility filter
+ledger.get_history(account)                    -- resolves counterparty through clearing
+ledger.rebuild_balances(ledger)                -- data repair
 ```
 
 ### Key design decisions
@@ -76,6 +81,9 @@ ledger.get_history(account)                    -- transaction history with runni
 - **Balance constraints.** Per-account flags: `debits_must_not_exceed_credits` and `credits_must_not_exceed_debits`. Checked path uses conditional UPDATE. Pending holds count against constraints.
 - **Pending state in `data.pending` table.** Not counters on accounts. Rows exist while hold is active, deleted on resolve. No drift.
 - **Idempotency.** Optional `idempotency_key` on transactions. Partial unique index. Race condition handled via unique_violation catch.
+- **Account closing.** `is_closed` flag. Rejects post_transaction, reserve, commit, correct. Allows void and release (must be able to unwind).
+- **Linked transfers.** `link_id` (bigint) groups multi-leg transactions. Internal `clearing` account (visibility='internal') as intermediary. `get_history()` resolves counterparty through clearing automatically.
+- **Account visibility.** `visibility` column: `'standard'` (user-facing) or `'internal'` (system). `get_accounts()` hides internal by default.
 
 ### Balance system
 
@@ -83,6 +91,7 @@ ledger.get_history(account)                    -- transaction history with runni
 - **Historical balance:** `data.balances` table (append-only, one row per account per transaction)
 - **Pending holds:** `data.pending` table (active holds only, deleted on resolve)
 - **Balance = `debits_total - credits_total`** (asset_like) or **`credits_total - debits_total`** (liability_like/equity)
+- **Pending refactor:** Remove `internal_type`, use `type` for balance direction
 
 ## Development Conventions
 
