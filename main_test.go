@@ -5640,6 +5640,181 @@ func TestLedger(t *testing.T) {
 		is.Equal(txDate.Month(), now.Month())
 		is.Equal(txDate.Day(), now.Day())
 	})
+
+	// --- void and correct tests ---
+	// set up a fresh ledger for void/correct tests to avoid interference
+	var voidLedgerUUID, voidCheckingUUID, voidIncomeUUID string
+
+	t.Run("VoidSetup", func(t *testing.T) {
+		is := is_.New(t)
+
+		err := conn.QueryRow(ctx, `select ledger.create_ledger('Void Test Ledger')`).Scan(&voidLedgerUUID)
+		is.NoErr(err)
+
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, voidLedgerUUID).Scan(&voidCheckingUUID)
+		is.NoErr(err)
+
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, voidLedgerUUID).Scan(&voidIncomeUUID)
+		is.NoErr(err)
+	})
+
+	t.Run("VoidCreatesReversal", func(t *testing.T) {
+		is := is_.New(t)
+
+		// post a transaction
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 50000, '2025-03-15', 'Original payment')
+		`, voidLedgerUUID, voidCheckingUUID, voidIncomeUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		// verify balance before void
+		var balance int64
+		err = conn.QueryRow(ctx, `select api.get_account_balance($1)`, voidCheckingUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(50000))
+
+		// void it
+		var reversalUUID string
+		err = conn.QueryRow(ctx, `select ledger.void($1, 'Wrong amount')`, txUUID).Scan(&reversalUUID)
+		is.NoErr(err)
+		is.True(len(reversalUUID) == 8)
+
+		// balance should be restored to 0
+		err = conn.QueryRow(ctx, `select api.get_account_balance($1)`, voidCheckingUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(0))
+	})
+
+	t.Run("VoidCreatesTransactionLog", func(t *testing.T) {
+		is := is_.New(t)
+
+		var mutationType, reason string
+		err := conn.QueryRow(ctx, `
+			select mutation_type, reason from data.transaction_log
+			where user_data = $1
+			order by created_at desc limit 1
+		`, testUserID).Scan(&mutationType, &reason)
+		is.NoErr(err)
+		is.Equal(mutationType, "deletion")
+		is.Equal(reason, "Wrong amount")
+	})
+
+	t.Run("VoidRejectsInvalidTransaction", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select ledger.void('nonexistent')`)
+		is.True(err != nil)
+	})
+
+	t.Run("CorrectChangesAmount", func(t *testing.T) {
+		is := is_.New(t)
+
+		// post a transaction
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 10000, '2025-03-20', 'Groceries')
+		`, voidLedgerUUID, voidCheckingUUID, voidIncomeUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		// correct amount from 10000 to 15000
+		var correctionUUID string
+		err = conn.QueryRow(ctx, `
+			select ledger.correct($1, p_amount := 15000, p_reason := 'Was $100 not $150')
+		`, txUUID).Scan(&correctionUUID)
+		is.NoErr(err)
+		is.True(len(correctionUUID) == 8)
+		is.True(correctionUUID != txUUID) // should be a new transaction
+
+		// verify corrected transaction has new amount
+		var amount int64
+		err = conn.QueryRow(ctx, `select amount from data.transactions where uuid = $1`, correctionUUID).Scan(&amount)
+		is.NoErr(err)
+		is.Equal(amount, int64(15000))
+	})
+
+	t.Run("CorrectPreservesUnchangedFields", func(t *testing.T) {
+		is := is_.New(t)
+
+		// post a transaction
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 20000, '2025-04-01', 'Rent')
+		`, voidLedgerUUID, voidCheckingUUID, voidIncomeUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		// correct only the description
+		var correctionUUID string
+		err = conn.QueryRow(ctx, `
+			select ledger.correct($1, p_description := 'April rent')
+		`, txUUID).Scan(&correctionUUID)
+		is.NoErr(err)
+
+		// verify amount and date carried over, description changed
+		var amount int64
+		var desc string
+		var txDate time.Time
+		err = conn.QueryRow(ctx, `
+			select amount, description, date from data.transactions where uuid = $1
+		`, correctionUUID).Scan(&amount, &desc, &txDate)
+		is.NoErr(err)
+		is.Equal(amount, int64(20000))           // unchanged
+		is.Equal(desc, "April rent")              // changed
+		is.Equal(txDate.Day(), 1)                 // unchanged
+	})
+
+	t.Run("CorrectCreatesTransactionLog", func(t *testing.T) {
+		is := is_.New(t)
+
+		var mutationType string
+		var reversalID, correctionID *int64
+		err := conn.QueryRow(ctx, `
+			select mutation_type, reversal_transaction_id, correction_transaction_id
+			from data.transaction_log
+			where user_data = $1 and mutation_type = 'correction'
+			order by created_at desc limit 1
+		`, testUserID).Scan(&mutationType, &reversalID, &correctionID)
+		is.NoErr(err)
+		is.Equal(mutationType, "correction")
+		is.True(reversalID != nil)    // reversal was created
+		is.True(correctionID != nil)  // correction was created
+	})
+
+	t.Run("CorrectRejectsInvalidTransaction", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select ledger.correct('nonexistent', p_amount := 100)`)
+		is.True(err != nil)
+	})
+
+	t.Run("CorrectBalancesAreCorrect", func(t *testing.T) {
+		is := is_.New(t)
+
+		// fresh ledger for clean balance check
+		var freshLedger, freshChecking, freshIncome string
+		err := conn.QueryRow(ctx, `select ledger.create_ledger('Balance Correct Test')`).Scan(&freshLedger)
+		is.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, freshLedger).Scan(&freshChecking)
+		is.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, freshLedger).Scan(&freshIncome)
+		is.NoErr(err)
+
+		// post 10000
+		var txUUID string
+		err = conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 10000, '2025-03-15', 'Original')
+		`, freshLedger, freshChecking, freshIncome).Scan(&txUUID)
+		is.NoErr(err)
+
+		// correct to 15000 — reversal (-10000) + new (+15000) = net 15000
+		_, err = conn.Exec(ctx, `select ledger.correct($1, p_amount := 15000)`, txUUID)
+		is.NoErr(err)
+
+		var balance int64
+		err = conn.QueryRow(ctx, `select api.get_account_balance($1)`, freshChecking).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(15000)) // net: 10000 - 10000 + 15000
+	})
 }
 
 func TestBalancesTable(t *testing.T) {
