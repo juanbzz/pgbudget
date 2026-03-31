@@ -6013,6 +6013,144 @@ func TestLedgerQueries(t *testing.T) {
 	})
 }
 
+func TestIdempotency(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "idempotency_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	var ledgerUUID, checkingUUID, revenueUUID string
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Idempotency Test')`).Scan(&ledgerUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+	is.NoErr(err)
+
+	t.Run("PostWithKey", func(t *testing.T) {
+		is := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 10000, '2025-03-01', 'Paycheck', 'key_001')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&txUUID)
+		is.NoErr(err)
+		is.True(len(txUUID) == 8)
+	})
+
+	t.Run("SameKeyReturnsSameUUID", func(t *testing.T) {
+		is := is_.New(t)
+
+		// first call
+		var uuid1 string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 50000, '2025-03-15', 'Deposit', 'dup_key')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&uuid1)
+		is.NoErr(err)
+
+		// second call with same key — should return same uuid, not create duplicate
+		var uuid2 string
+		err = conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 50000, '2025-03-15', 'Deposit', 'dup_key')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&uuid2)
+		is.NoErr(err)
+
+		is.Equal(uuid1, uuid2) // same transaction returned
+	})
+
+	t.Run("SameKeyDifferentDataStillReturnsOriginal", func(t *testing.T) {
+		is := is_.New(t)
+
+		// first call
+		var uuid1 string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 1000, '2025-03-01', 'Original', 'idempotent_key')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&uuid1)
+		is.NoErr(err)
+
+		// second call with same key but different amount/description — still returns original
+		var uuid2 string
+		err = conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 9999, '2025-04-01', 'Different', 'idempotent_key')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&uuid2)
+		is.NoErr(err)
+
+		is.Equal(uuid1, uuid2) // idempotent, not upsert
+	})
+
+	t.Run("NoKeyNoIdempotency", func(t *testing.T) {
+		is := is_.New(t)
+
+		// two calls without key — should create two different transactions
+		var uuid1, uuid2 string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 100, '2025-03-01', 'No key 1')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&uuid1)
+		is.NoErr(err)
+
+		err = conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 100, '2025-03-01', 'No key 2')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&uuid2)
+		is.NoErr(err)
+
+		is.True(uuid1 != uuid2) // two separate transactions
+	})
+
+	t.Run("DifferentKeysDifferentTransactions", func(t *testing.T) {
+		is := is_.New(t)
+
+		var uuid1, uuid2 string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 100, '2025-03-01', 'A', 'key_a')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&uuid1)
+		is.NoErr(err)
+
+		err = conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 100, '2025-03-01', 'B', 'key_b')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&uuid2)
+		is.NoErr(err)
+
+		is.True(uuid1 != uuid2)
+	})
+
+	t.Run("BalanceNotDoubled", func(t *testing.T) {
+		is := is_.New(t)
+
+		// fresh accounts for clean balance check
+		var freshLedger, freshChecking, freshRevenue string
+		err := conn.QueryRow(ctx, `select ledger.create_ledger('Balance Dedup Test')`).Scan(&freshLedger)
+		is.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, freshLedger).Scan(&freshChecking)
+		is.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, freshLedger).Scan(&freshRevenue)
+		is.NoErr(err)
+
+		// post with key
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 25000, '2025-03-01', 'Once', 'once_key')
+		`, freshLedger, freshChecking, freshRevenue)
+		is.NoErr(err)
+
+		// retry same key
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 25000, '2025-03-01', 'Once', 'once_key')
+		`, freshLedger, freshChecking, freshRevenue)
+		is.NoErr(err)
+
+		// balance should be 25000, not 50000
+		var balance int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, freshChecking).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(25000)) // not doubled
+	})
+}
+
 func TestBalanceConstraints(t *testing.T) {
 	is := is_.New(t)
 	ctx := context.Background()
