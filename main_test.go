@@ -6013,6 +6013,183 @@ func TestLedgerQueries(t *testing.T) {
 	})
 }
 
+func TestPostTransactions(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "batch_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	var ledgerUUID, checkingUUID, savingsUUID, revenueUUID string
+
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Batch Test')`).Scan(&ledgerUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Savings', 'asset')`, ledgerUUID).Scan(&savingsUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+	is.NoErr(err)
+
+	t.Run("BatchOfThree", func(t *testing.T) {
+		is := is_.New(t)
+
+		var uuids []string
+		err := conn.QueryRow(ctx, `
+			select ledger.post_transactions($1, $2::jsonb)
+		`, ledgerUUID, fmt.Sprintf(`[
+			{"debit": "%s", "credit": "%s", "amount": 100000, "date": "2025-03-01", "description": "Paycheck"},
+			{"debit": "%s", "credit": "%s", "amount": 30000, "date": "2025-03-05", "description": "To savings"},
+			{"debit": "%s", "credit": "%s", "amount": 50000, "date": "2025-03-15", "description": "Freelance"}
+		]`, checkingUUID, revenueUUID, savingsUUID, checkingUUID, checkingUUID, revenueUUID)).Scan(&uuids)
+		is.NoErr(err)
+		is.Equal(len(uuids), 3)
+		is.True(len(uuids[0]) == 8)
+		is.True(len(uuids[1]) == 8)
+		is.True(len(uuids[2]) == 8)
+	})
+
+	t.Run("BalancesCorrectAfterBatch", func(t *testing.T) {
+		is := is_.New(t)
+
+		// checking: debited 100000 + 50000, credited 30000 → 120000
+		var balance int64
+		err := conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(120000))
+
+		// savings: debited 30000 → 30000
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, savingsUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(30000))
+
+		// revenue: credited 150000 → 150000
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, revenueUUID).Scan(&balance)
+		is.NoErr(err)
+		is.Equal(balance, int64(150000))
+	})
+
+	t.Run("BalanceHistoryIsSequential", func(t *testing.T) {
+		is := is_.New(t)
+
+		// checking has 3 transactions — running balances should be sequential, not all the same
+		type historyRow struct {
+			Amount         int64
+			RunningBalance int64
+		}
+
+		rows, err := conn.Query(ctx, `
+			select amount, running_balance from ledger.get_history($1)
+		`, checkingUUID)
+		is.NoErr(err)
+		defer rows.Close()
+
+		var history []historyRow
+		for rows.Next() {
+			var h historyRow
+			err := rows.Scan(&h.Amount, &h.RunningBalance)
+			is.NoErr(err)
+			history = append(history, h)
+		}
+		is.NoErr(rows.Err())
+
+		is.Equal(len(history), 3)
+		// newest first
+		is.Equal(history[0].RunningBalance, int64(120000)) // after freelance
+		is.Equal(history[1].RunningBalance, int64(70000))  // after savings transfer
+		is.Equal(history[2].RunningBalance, int64(100000)) // after paycheck
+	})
+
+	t.Run("EmptyArray", func(t *testing.T) {
+		is := is_.New(t)
+
+		var uuids []string
+		err := conn.QueryRow(ctx, `select ledger.post_transactions($1, '[]'::jsonb)`, ledgerUUID).Scan(&uuids)
+		is.NoErr(err)
+		is.Equal(len(uuids), 0)
+	})
+
+	t.Run("RejectsInvalidAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.post_transactions($1, $2::jsonb)
+		`, ledgerUUID, fmt.Sprintf(`[
+			{"debit": "%s", "credit": "%s", "amount": 1000, "description": "Good"},
+			{"debit": "nonexistent", "credit": "%s", "amount": 1000, "description": "Bad"}
+		]`, checkingUUID, revenueUUID, revenueUUID))
+		is.True(err != nil)
+	})
+
+	t.Run("RejectsZeroAmount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.post_transactions($1, $2::jsonb)
+		`, ledgerUUID, fmt.Sprintf(`[
+			{"debit": "%s", "credit": "%s", "amount": 0, "description": "Zero"}
+		]`, checkingUUID, revenueUUID))
+		is.True(err != nil)
+	})
+
+	t.Run("AtomicRollback", func(t *testing.T) {
+		is := is_.New(t)
+
+		// get balance before
+		var balanceBefore int64
+		err := conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
+		is.NoErr(err)
+
+		// batch with one good + one bad — should all roll back
+		_, err = conn.Exec(ctx, `
+			select ledger.post_transactions($1, $2::jsonb)
+		`, ledgerUUID, fmt.Sprintf(`[
+			{"debit": "%s", "credit": "%s", "amount": 99999, "description": "Good one"},
+			{"debit": "%s", "credit": "%s", "amount": -1, "description": "Bad one"}
+		]`, checkingUUID, revenueUUID, checkingUUID, revenueUUID))
+		is.True(err != nil) // should fail
+
+		// balance should be unchanged
+		var balanceAfter int64
+		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
+		is.NoErr(err)
+		is.Equal(balanceBefore, balanceAfter) // no change — batch rolled back
+	})
+
+	t.Run("RejectsInvalidLedger", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.post_transactions('nonexistent', $1::jsonb)
+		`, fmt.Sprintf(`[{"debit": "%s", "credit": "%s", "amount": 1000}]`, checkingUUID, revenueUUID))
+		is.True(err != nil)
+	})
+
+	t.Run("RejectsNonArray", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.post_transactions($1, '{"not": "array"}'::jsonb)
+		`, ledgerUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("RejectsMissingFields", func(t *testing.T) {
+		is := is_.New(t)
+
+		// missing amount
+		_, err := conn.Exec(ctx, `
+			select ledger.post_transactions($1, $2::jsonb)
+		`, ledgerUUID, fmt.Sprintf(`[{"debit": "%s", "credit": "%s"}]`, checkingUUID, revenueUUID))
+		is.True(err != nil)
+	})
+}
+
 func TestBalancesTable(t *testing.T) {
 	is := is_.New(t)
 	ctx := context.Background()
