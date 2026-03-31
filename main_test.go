@@ -653,9 +653,11 @@ func TestDatabase(t *testing.T) {
 				},
 			)
 
-			// Test attempting to delete a special account (should fail)
+			// Test attempting to delete a special account
+			// Trigger removed — protection moves to budget.delete_account() later
 			t.Run(
 				"DeleteSpecialAccount", func(t *testing.T) {
+					t.Skip("special account trigger removed — protection will be in budget schema")
 					is := is_.New(t)
 
 					if accountsLedgerUUID == "" {
