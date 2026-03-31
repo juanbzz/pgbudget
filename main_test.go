@@ -6015,6 +6015,152 @@ func TestLedgerQueries(t *testing.T) {
 	})
 }
 
+func TestAccountClosing(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	testUserID := "closing_test_user"
+	err = setTestUserContext(ctx, conn, testUserID)
+	is.NoErr(err)
+
+	var ledgerUUID, checkingUUID, savingsUUID, revenueUUID string
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Closing Test')`).Scan(&ledgerUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Savings', 'asset')`, ledgerUUID).Scan(&savingsUUID)
+	is.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+	is.NoErr(err)
+
+	// seed some balance
+	_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 100000, '2025-03-01', 'Seed')`, ledgerUUID, checkingUUID, revenueUUID)
+	is.NoErr(err)
+
+	t.Run("CloseAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select ledger.close_account($1)`, savingsUUID)
+		is.NoErr(err)
+
+		var isClosed bool
+		err = conn.QueryRow(ctx, `select is_closed from data.accounts where uuid = $1`, savingsUUID).Scan(&isClosed)
+		is.NoErr(err)
+		is.True(isClosed)
+	})
+
+	t.Run("PostTransactionRejectedOnClosedDebit", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 1000, '2025-03-02', 'Should fail')
+		`, ledgerUUID, savingsUUID, revenueUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("PostTransactionRejectedOnClosedCredit", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.post_transaction($1, $2, $3, 1000, '2025-03-02', 'Should fail')
+		`, ledgerUUID, checkingUUID, savingsUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("ReserveRejectedOnClosedAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.reserve($1, $2, $3, 1000, 300)
+		`, ledgerUUID, savingsUUID, revenueUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("CommitRejectedOnClosedAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		// reserve on open accounts first
+		var txUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.reserve($1, $2, $3, 5000, 300, '2025-03-03', 'Before close')
+		`, ledgerUUID, checkingUUID, revenueUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		// close the checking account
+		_, err = conn.Exec(ctx, `select ledger.close_account($1)`, checkingUUID)
+		is.NoErr(err)
+
+		// commit should fail
+		_, err = conn.Exec(ctx, `select ledger.commit($1)`, txUUID)
+		is.True(err != nil)
+
+		// but release should work
+		_, err = conn.Exec(ctx, `select ledger.release($1)`, txUUID)
+		is.NoErr(err)
+	})
+
+	t.Run("VoidAllowedOnClosedAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		// we need a transaction on the now-closed checking account to void
+		// use the seed transaction (posted before closing)
+		var seedUUID string
+		err := conn.QueryRow(ctx, `
+			select uuid from data.transactions
+			where description = 'Seed' and user_data = $1
+			limit 1
+		`, testUserID).Scan(&seedUUID)
+		is.NoErr(err)
+
+		// void should succeed even though checking is closed
+		var reversalUUID string
+		err = conn.QueryRow(ctx, `select ledger.void($1, 'Unwinding after close')`, seedUUID).Scan(&reversalUUID)
+		is.NoErr(err)
+		is.True(len(reversalUUID) == 8)
+	})
+
+	t.Run("CorrectRejectedOnClosedAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		// create a transaction between open accounts to try to correct into a closed one
+		var openAcctUUID string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Open Acct', 'asset')`, ledgerUUID).Scan(&openAcctUUID)
+		is.NoErr(err)
+
+		var txUUID string
+		err = conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 1000, '2025-03-04', 'To correct')
+		`, ledgerUUID, openAcctUUID, revenueUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		// try to correct the debit account to the closed savings — should fail
+		_, err = conn.Exec(ctx, `select ledger.correct($1, p_debit_account_uuid := $2)`, txUUID, savingsUUID)
+		is.True(err != nil)
+	})
+
+	t.Run("CloseAccountRejectsInvalidUUID", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select ledger.close_account('nonexistent')`)
+		is.True(err != nil)
+	})
+
+	t.Run("BatchRejectedOnClosedAccount", func(t *testing.T) {
+		is := is_.New(t)
+
+		_, err := conn.Exec(ctx, `
+			select ledger.post_transactions($1, $2::jsonb)
+		`, ledgerUUID, fmt.Sprintf(`[
+			{"debit": "%s", "credit": "%s", "amount": 100, "description": "Hits closed"}
+		]`, savingsUUID, revenueUUID))
+		is.True(err != nil)
+	})
+}
+
 func TestLedgerCRUD(t *testing.T) {
 	is := is_.New(t)
 	ctx := context.Background()

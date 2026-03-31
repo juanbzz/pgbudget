@@ -530,15 +530,58 @@ SELECT * FROM api.get_budget_status('d3pOOf6t');
 --  pQ4vWx7N      | Income        |        0 |        0 |   80000
 ```
 
+## Account Closing
+
+Accounts can be permanently closed with `ledger.close_account()`. A closed account rejects most new activity but allows unwinding existing state.
+
+```sql
+SELECT ledger.close_account('account_uuid');
+```
+
+### What's allowed on a closed account
+
+| Operation | Allowed? | Why |
+|---|---|---|
+| `ledger.post_transaction()` | No | No new transactions |
+| `ledger.post_transactions()` | No | Batch rejected if any entry hits closed account |
+| `ledger.reserve()` | No | No new holds |
+| `ledger.commit()` | No | Can't settle on a frozen account |
+| `ledger.release()` | **Yes** | Must be able to release pending holds |
+| `ledger.void()` | **Yes** | Must be able to reverse mistakes |
+| `ledger.correct()` | No | Creates a new transaction (reversal is allowed internally, but the corrected transaction is rejected) |
+| `ledger.get_balance()` | **Yes** | Read-only, always works |
+| `ledger.get_history()` | **Yes** | Read-only, always works |
+
+### Typical workflow
+
+```sql
+-- 1. Release any pending holds first
+SELECT ledger.release('pending_tx_uuid');
+
+-- 2. Void any incorrect transactions if needed
+SELECT ledger.void('mistake_tx_uuid', 'Closing account');
+
+-- 3. Close the account
+SELECT ledger.close_account('account_uuid');
+
+-- 4. Balance is still readable
+SELECT ledger.get_balance('account_uuid');
+```
+
+Closing is permanent — there is no reopen function. If you need the account again, create a new one.
+
 ## Architecture
 
-The database uses a three-schema design:
+The database uses a four-schema design:
 
-- **`data`**: Raw tables and constraints
-- **`utils`**: Internal business logic functions
-- **`api`**: Public interface functions with UUID parameters
+- **`data`**: Tables, constraints, and RLS policies
+- **`utils`**: Internal helper functions (validation, write paths)
+- **`ledger`**: Generic double-entry accounting engine
+- **`budget`**: Budgeting application layer (planned)
 
-This separation ensures clean interfaces while maintaining internal flexibility.
+The `ledger` schema is a complete double-entry engine inspired by [TigerBeetle](https://tigerbeetle.com/). It handles accounts, transactions, balances, corrections, two-phase transfers, batch inserts, idempotency, balance constraints, and account closing. It knows nothing about budgeting — it just moves numbers between accounts.
+
+The `budget` schema (planned) will sit on top, translating budgeting vocabulary (income, expenses, categories) into ledger operations.
 
 ## License
 
