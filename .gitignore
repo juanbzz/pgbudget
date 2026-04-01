@@ -198,3 +198,4 @@ migrations_old
 nogit_docs
 .claude
 .context
+.agents

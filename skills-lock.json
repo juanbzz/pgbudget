@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "postgres-schema-design": {
+      "source": "ssh://git@box2:2222/juan/skills.git",
+      "sourceType": "git",
+      "computedHash": "4a62c25d3495098bb830a97633e4f2808430055ed5a4ebfaaa18ed5e5cbab0e3"
+    }
+  }
+}
