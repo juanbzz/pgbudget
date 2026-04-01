@@ -46,6 +46,17 @@ func TestMain(m *testing.M) {
 	os.Exit(exitCode)
 }
 
+
+// getBalance fetches raw counters from ledger.get_balance
+func getBalance(ctx context.Context, conn *pgx.Conn, accountUUID string) (int64, int64, error) {
+	var debits, credits int64
+	err := conn.QueryRow(ctx,
+		`select debits_total, credits_total from ledger.get_balance($1)`,
+		accountUUID,
+	).Scan(&debits, &credits)
+	return debits, credits, err
+}
+
 // setTestUserContext sets the user context for the database session
 // This simulates what the Go microservice would do for each authenticated request
 func setTestUserContext(ctx context.Context, conn *pgx.Conn, userID string) error {
@@ -133,41 +144,31 @@ func TestLedger(t *testing.T) {
 	t.Run("CreateAccount", func(t *testing.T) {
 		is := is_.New(t)
 
-		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking')`, ledgerUUID).Scan(&checkingUUID)
 		is.NoErr(err)
 		is.True(len(checkingUUID) == 8)
 
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Savings', 'asset')`, ledgerUUID).Scan(&savingsUUID)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Savings')`, ledgerUUID).Scan(&savingsUUID)
 		is.NoErr(err)
 
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Visa', 'liability')`, ledgerUUID).Scan(&visaUUID)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Visa')`, ledgerUUID).Scan(&visaUUID)
 		is.NoErr(err)
 
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&incomeUUID)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue')`, ledgerUUID).Scan(&incomeUUID)
 		is.NoErr(err)
-	})
-
-	t.Run("CreateAccountValidatesType", func(t *testing.T) {
-		is := is_.New(t)
-
-		_, err := conn.Exec(ctx, `select ledger.create_account($1, 'Bad', 'revenue')`, ledgerUUID)
-		is.True(err != nil)
-
-		_, err = conn.Exec(ctx, `select ledger.create_account($1, 'Bad', 'expense')`, ledgerUUID)
-		is.True(err != nil)
 	})
 
 	t.Run("CreateAccountRejectsEmptyName", func(t *testing.T) {
 		is := is_.New(t)
 
-		_, err := conn.Exec(ctx, `select ledger.create_account($1, '', 'asset')`, ledgerUUID)
+		_, err := conn.Exec(ctx, `select ledger.create_account($1, '')`, ledgerUUID)
 		is.True(err != nil)
 	})
 
 	t.Run("CreateAccountRejectsInvalidLedger", func(t *testing.T) {
 		is := is_.New(t)
 
-		_, err := conn.Exec(ctx, `select ledger.create_account('nonexistent', 'Checking', 'asset')`)
+		_, err := conn.Exec(ctx, `select ledger.create_account('nonexistent', 'Checking')`)
 		is.True(err != nil)
 	})
 
@@ -263,21 +264,25 @@ func TestLedger(t *testing.T) {
 	t.Run("BalanceFromCounters", func(t *testing.T) {
 		is := is_.New(t)
 
-		// checking: asset_like → balance = debits - credits = 100000 - 25000 = 75000
-		var balance int64
-		err := conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balance)
-		is.NoErr(err)
-		is.Equal(balance, int64(75000))
+		var debits, credits int64
 
-		// income: equity → balance = credits - debits = 100000 - 0 = 100000
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, incomeUUID).Scan(&balance)
+		// checking: debits=100000 credits=25000
+		debits, credits, err := getBalance(ctx, conn, checkingUUID)
 		is.NoErr(err)
-		is.Equal(balance, int64(100000))
+		is.Equal(debits, int64(100000))
+		is.Equal(credits, int64(25000))
 
-		// visa: liability_like → balance = credits - debits = 0 - 25000 = -25000
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, visaUUID).Scan(&balance)
+		// income: debits=0 credits=100000
+		debits, credits, err = getBalance(ctx, conn, incomeUUID)
 		is.NoErr(err)
-		is.Equal(balance, int64(-25000))
+		is.Equal(debits, int64(0))
+		is.Equal(credits, int64(100000))
+
+		// visa: debits=25000 credits=0
+		debits, credits, err = getBalance(ctx, conn, visaUUID)
+		is.NoErr(err)
+		is.Equal(debits, int64(25000))
+		is.Equal(credits, int64(0))
 	})
 
 	t.Run("PostTransactionRejectsZeroAmount", func(t *testing.T) {
@@ -364,10 +369,10 @@ func TestLedger(t *testing.T) {
 		err := conn.QueryRow(ctx, `select ledger.create_ledger('Void Test Ledger')`).Scan(&voidLedgerUUID)
 		is.NoErr(err)
 
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, voidLedgerUUID).Scan(&voidCheckingUUID)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking')`, voidLedgerUUID).Scan(&voidCheckingUUID)
 		is.NoErr(err)
 
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, voidLedgerUUID).Scan(&voidIncomeUUID)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue')`, voidLedgerUUID).Scan(&voidIncomeUUID)
 		is.NoErr(err)
 	})
 
@@ -381,11 +386,11 @@ func TestLedger(t *testing.T) {
 		`, voidLedgerUUID, voidCheckingUUID, voidIncomeUUID).Scan(&txUUID)
 		is.NoErr(err)
 
-		// verify balance before void
-		var balance int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, voidCheckingUUID).Scan(&balance)
+		// verify counters before void
+		debits, credits, err := getBalance(ctx, conn, voidCheckingUUID)
 		is.NoErr(err)
-		is.Equal(balance, int64(50000))
+		is.Equal(debits, int64(50000))
+		is.Equal(credits, int64(0))
 
 		// void it
 		var reversalUUID string
@@ -393,10 +398,11 @@ func TestLedger(t *testing.T) {
 		is.NoErr(err)
 		is.True(len(reversalUUID) == 8)
 
-		// balance should be restored to 0
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, voidCheckingUUID).Scan(&balance)
+		// after void: reversal credits the same amount back, net zero
+		debits, credits, err = getBalance(ctx, conn, voidCheckingUUID)
 		is.NoErr(err)
-		is.Equal(balance, int64(0))
+		is.Equal(debits, int64(50000))
+		is.Equal(credits, int64(50000))
 	})
 
 	t.Run("VoidCreatesTransactionLog", func(t *testing.T) {
@@ -507,9 +513,9 @@ func TestLedger(t *testing.T) {
 		var freshLedger, freshChecking, freshIncome string
 		err := conn.QueryRow(ctx, `select ledger.create_ledger('Balance Correct Test')`).Scan(&freshLedger)
 		is.NoErr(err)
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, freshLedger).Scan(&freshChecking)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking')`, freshLedger).Scan(&freshChecking)
 		is.NoErr(err)
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, freshLedger).Scan(&freshIncome)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue')`, freshLedger).Scan(&freshIncome)
 		is.NoErr(err)
 
 		// post 10000
@@ -523,10 +529,11 @@ func TestLedger(t *testing.T) {
 		_, err = conn.Exec(ctx, `select ledger.correct($1, p_amount := 15000)`, txUUID)
 		is.NoErr(err)
 
-		var balance int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, freshChecking).Scan(&balance)
+		// checking: original 10000 debit + reversal 10000 credit + new 15000 debit
+		debits, credits, err := getBalance(ctx, conn, freshChecking)
 		is.NoErr(err)
-		is.Equal(balance, int64(15000)) // net: 10000 - 10000 + 15000
+		is.Equal(debits, int64(25000))  // 10000 + 15000
+		is.Equal(credits, int64(10000)) // reversal
 	})
 }
 
@@ -547,11 +554,11 @@ func TestLedgerQueries(t *testing.T) {
 
 	err = conn.QueryRow(ctx, `select ledger.create_ledger('Query Test Ledger')`).Scan(&ledgerUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking')`, ledgerUUID).Scan(&checkingUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Savings', 'asset')`, ledgerUUID).Scan(&savingsUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Savings')`, ledgerUUID).Scan(&savingsUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue')`, ledgerUUID).Scan(&revenueUUID)
 	is.NoErr(err)
 
 	// post some transactions
@@ -568,21 +575,23 @@ func TestLedgerQueries(t *testing.T) {
 	t.Run("GetBalance", func(t *testing.T) {
 		is := is_.New(t)
 
-		// checking: debits 150000, credits 30000 → balance 120000
-		var balance int64
-		err := conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balance)
+		// checking: debits=150000, credits=30000
+		debits, credits, err := getBalance(ctx, conn, checkingUUID)
 		is.NoErr(err)
-		is.Equal(balance, int64(120000))
+		is.Equal(debits, int64(150000))
+		is.Equal(credits, int64(30000))
 
-		// savings: debits 30000, credits 0 → balance 30000
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, savingsUUID).Scan(&balance)
+		// savings: debits=30000, credits=0
+		debits, credits, err = getBalance(ctx, conn, savingsUUID)
 		is.NoErr(err)
-		is.Equal(balance, int64(30000))
+		is.Equal(debits, int64(30000))
+		is.Equal(credits, int64(0))
 
-		// revenue: equity → credits 150000, debits 0 → balance 150000
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, revenueUUID).Scan(&balance)
+		// revenue: debits=0, credits=150000
+		debits, credits, err = getBalance(ctx, conn, revenueUUID)
 		is.NoErr(err)
-		is.Equal(balance, int64(150000))
+		is.Equal(debits, int64(0))
+		is.Equal(credits, int64(150000))
 	})
 
 	t.Run("GetBalanceRejectsInvalidAccount", func(t *testing.T) {
@@ -598,8 +607,8 @@ func TestLedgerQueries(t *testing.T) {
 		type accountBalance struct {
 			UUID    string
 			Name    string
-			Type    string
-			Balance int64
+			Debits  int64
+			Credits int64
 		}
 
 		rows, err := conn.Query(ctx, `select * from ledger.get_balances($1)`, ledgerUUID)
@@ -609,30 +618,30 @@ func TestLedgerQueries(t *testing.T) {
 		var balances []accountBalance
 		for rows.Next() {
 			var ab accountBalance
-			err := rows.Scan(&ab.UUID, &ab.Name, &ab.Type, &ab.Balance)
+			err := rows.Scan(&ab.UUID, &ab.Name, &ab.Debits, &ab.Credits)
 			is.NoErr(err)
 			balances = append(balances, ab)
 		}
 		is.NoErr(rows.Err())
 
-		// should have at least our 3 accounts (plus any default accounts from trigger)
+		// should have at least our 3 accounts
 		is.True(len(balances) >= 3)
 
-		// find our accounts and verify balances
+		// find our accounts and verify counters
 		var foundChecking, foundSavings, foundRevenue bool
 		for _, ab := range balances {
 			switch ab.UUID {
 			case checkingUUID:
-				is.Equal(ab.Balance, int64(120000))
-				is.Equal(ab.Type, "asset")
+				is.Equal(ab.Debits, int64(150000))
+				is.Equal(ab.Credits, int64(30000))
 				foundChecking = true
 			case savingsUUID:
-				is.Equal(ab.Balance, int64(30000))
-				is.Equal(ab.Type, "asset")
+				is.Equal(ab.Debits, int64(30000))
+				is.Equal(ab.Credits, int64(0))
 				foundSavings = true
 			case revenueUUID:
-				is.Equal(ab.Balance, int64(150000))
-				is.Equal(ab.Type, "equity")
+				is.Equal(ab.Debits, int64(0))
+				is.Equal(ab.Credits, int64(150000))
 				foundRevenue = true
 			}
 		}
@@ -652,13 +661,14 @@ func TestLedgerQueries(t *testing.T) {
 		is := is_.New(t)
 
 		type historyRow struct {
-			TxUUID         string
-			Date           time.Time
-			Description    string
-			Counterparty   string
-			Amount         int64
-			Direction      string
-			RunningBalance int64
+			TxUUID       string
+			Date         time.Time
+			Description  string
+			Counterparty string
+			Amount       int64
+			Direction    string
+			DebitsTotal  int64
+			CreditsTotal int64
 		}
 
 		rows, err := conn.Query(ctx, `select * from ledger.get_history($1)`, checkingUUID)
@@ -668,7 +678,7 @@ func TestLedgerQueries(t *testing.T) {
 		var history []historyRow
 		for rows.Next() {
 			var h historyRow
-			err := rows.Scan(&h.TxUUID, &h.Date, &h.Description, &h.Counterparty, &h.Amount, &h.Direction, &h.RunningBalance)
+			err := rows.Scan(&h.TxUUID, &h.Date, &h.Description, &h.Counterparty, &h.Amount, &h.Direction, &h.DebitsTotal, &h.CreditsTotal)
 			is.NoErr(err)
 			history = append(history, h)
 		}
@@ -681,19 +691,22 @@ func TestLedgerQueries(t *testing.T) {
 		is.Equal(history[0].Description, "Freelance")
 		is.Equal(history[0].Amount, int64(50000))
 		is.Equal(history[0].Direction, "debit")
-		is.Equal(history[0].RunningBalance, int64(120000)) // 100000 - 30000 + 50000
+		is.Equal(history[0].DebitsTotal, int64(150000))
+		is.Equal(history[0].CreditsTotal, int64(30000))
 
 		// middle: To savings (credit checking 30000)
 		is.Equal(history[1].Description, "To savings")
 		is.Equal(history[1].Amount, int64(30000))
 		is.Equal(history[1].Direction, "credit")
-		is.Equal(history[1].RunningBalance, int64(70000)) // 100000 - 30000
+		is.Equal(history[1].DebitsTotal, int64(100000))
+		is.Equal(history[1].CreditsTotal, int64(30000))
 
 		// oldest: Paycheck (debit checking 100000)
 		is.Equal(history[2].Description, "Paycheck")
 		is.Equal(history[2].Amount, int64(100000))
 		is.Equal(history[2].Direction, "debit")
-		is.Equal(history[2].RunningBalance, int64(100000))
+		is.Equal(history[2].DebitsTotal, int64(100000))
+		is.Equal(history[2].CreditsTotal, int64(0))
 	})
 
 	t.Run("GetHistoryCounterparty", func(t *testing.T) {
@@ -742,28 +755,29 @@ func TestLinkedTransfers(t *testing.T) {
 	err = conn.QueryRow(ctx, `select ledger.create_ledger('Linked Test')`).Scan(&ledgerUUID)
 	is.NoErr(err)
 
-	// get the auto-created clearing account
+	// manually create the clearing account (internal, for linked transfers)
 	var clearingUUID string
 	err = conn.QueryRow(ctx, `
-		select account_uuid from ledger.get_accounts($1, true)
-		where visibility = 'internal' and account_name = 'clearing'
-	`, ledgerUUID).Scan(&clearingUUID)
+		insert into data.accounts (name, ledger_id, user_data, visibility)
+		values ('clearing', (select id from data.ledgers where uuid = $1), $2, 'internal')
+		returning uuid
+	`, ledgerUUID, testUserID).Scan(&clearingUUID)
 	is.NoErr(err)
 
 	// create user accounts
 	var checkingUUID, visaUUID, revenueUUID string
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking')`, ledgerUUID).Scan(&checkingUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Visa', 'liability')`, ledgerUUID).Scan(&visaUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Visa')`, ledgerUUID).Scan(&visaUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue')`, ledgerUUID).Scan(&revenueUUID)
 	is.NoErr(err)
 
 	// seed checking with balance
 	_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 500000, '2025-03-01', 'Seed')`, ledgerUUID, checkingUUID, revenueUUID)
 	is.NoErr(err)
 
-	t.Run("ClearingAccountAutoCreated", func(t *testing.T) {
+	t.Run("ClearingAccountVisibility", func(t *testing.T) {
 		is := is_.New(t)
 
 		is.True(len(clearingUUID) == 8)
@@ -813,10 +827,9 @@ func TestLinkedTransfers(t *testing.T) {
 	t.Run("ClearingAccountNetsToZero", func(t *testing.T) {
 		is := is_.New(t)
 
-		var balance int64
-		err := conn.QueryRow(ctx, `select ledger.get_balance($1)`, clearingUUID).Scan(&balance)
+		debits, credits, err := getBalance(ctx, conn, clearingUUID)
 		is.NoErr(err)
-		is.Equal(balance, int64(0)) // clearing always nets to zero
+		is.Equal(debits, credits) // clearing always nets to zero
 	})
 
 	t.Run("GetHistoryResolvesCounterparty", func(t *testing.T) {
@@ -901,11 +914,10 @@ func TestLinkedTransfers(t *testing.T) {
 		is.NoErr(err)
 		is.Equal(len(uuids), 3)
 
-		// clearing still nets to zero (credited 30000+20000, debited 50000)
-		var balance int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, clearingUUID).Scan(&balance)
+		// clearing still nets to zero
+		debits, credits, err := getBalance(ctx, conn, clearingUUID)
 		is.NoErr(err)
-		is.Equal(balance, int64(0))
+		is.Equal(debits, credits)
 	})
 }
 
@@ -924,11 +936,11 @@ func TestAccountClosing(t *testing.T) {
 	var ledgerUUID, checkingUUID, savingsUUID, revenueUUID string
 	err = conn.QueryRow(ctx, `select ledger.create_ledger('Closing Test')`).Scan(&ledgerUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking')`, ledgerUUID).Scan(&checkingUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Savings', 'asset')`, ledgerUUID).Scan(&savingsUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Savings')`, ledgerUUID).Scan(&savingsUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue')`, ledgerUUID).Scan(&revenueUUID)
 	is.NoErr(err)
 
 	// seed some balance
@@ -1022,7 +1034,7 @@ func TestAccountClosing(t *testing.T) {
 
 		// create a transaction between open accounts to try to correct into a closed one
 		var openAcctUUID string
-		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Open Acct', 'asset')`, ledgerUUID).Scan(&openAcctUUID)
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Open Acct')`, ledgerUUID).Scan(&openAcctUUID)
 		is.NoErr(err)
 
 		var txUUID string
@@ -1075,44 +1087,43 @@ func TestLedgerCRUD(t *testing.T) {
 		is.NoErr(err)
 
 		// create accounts of different types
-		_, err = conn.Exec(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID)
+		_, err = conn.Exec(ctx, `select ledger.create_account($1, 'Checking')`, ledgerUUID)
 		is.NoErr(err)
-		_, err = conn.Exec(ctx, `select ledger.create_account($1, 'Visa', 'liability')`, ledgerUUID)
+		_, err = conn.Exec(ctx, `select ledger.create_account($1, 'Visa')`, ledgerUUID)
 		is.NoErr(err)
-		_, err = conn.Exec(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID)
+		_, err = conn.Exec(ctx, `select ledger.create_account($1, 'Revenue')`, ledgerUUID)
 		is.NoErr(err)
 
 		type account struct {
 			UUID        string
 			Name        string
-			Type        string
 			Description *string
 		}
 
-		rows, err := conn.Query(ctx, `select account_uuid, account_name, account_type, description from ledger.get_accounts($1)`, ledgerUUID)
+		rows, err := conn.Query(ctx, `select account_uuid, account_name, description from ledger.get_accounts($1)`, ledgerUUID)
 		is.NoErr(err)
 		defer rows.Close()
 
 		var accounts []account
 		for rows.Next() {
 			var a account
-			err := rows.Scan(&a.UUID, &a.Name, &a.Type, &a.Description)
+			err := rows.Scan(&a.UUID, &a.Name, &a.Description)
 			is.NoErr(err)
 			accounts = append(accounts, a)
 		}
 		is.NoErr(rows.Err())
 
-		// should have our 3 + any default accounts from trigger
+		// should have our 3 accounts
 		is.True(len(accounts) >= 3)
 
 		// verify our accounts are present
-		names := make(map[string]string)
+		names := make(map[string]bool)
 		for _, a := range accounts {
-			names[a.Name] = a.Type
+			names[a.Name] = true
 		}
-		is.Equal(names["Checking"], "asset")
-		is.Equal(names["Visa"], "liability")
-		is.Equal(names["Revenue"], "equity")
+		is.True(names["Checking"])
+		is.True(names["Visa"])
+		is.True(names["Revenue"])
 	})
 
 	t.Run("GetAccountsRejectsInvalidLedger", func(t *testing.T) {
@@ -1130,9 +1141,9 @@ func TestLedgerCRUD(t *testing.T) {
 		err := conn.QueryRow(ctx, `select ledger.create_ledger('To Delete')`).Scan(&ledgerUUID)
 		is.NoErr(err)
 
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking')`, ledgerUUID).Scan(&checkingUUID)
 		is.NoErr(err)
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue')`, ledgerUUID).Scan(&revenueUUID)
 		is.NoErr(err)
 
 		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000, '2025-03-01', 'Seed')`, ledgerUUID, checkingUUID, revenueUUID)
@@ -1168,9 +1179,9 @@ func TestLedgerCRUD(t *testing.T) {
 		var ledgerUUID, checkingUUID, revenueUUID string
 		err := conn.QueryRow(ctx, `select ledger.create_ledger('Delete With Pending')`).Scan(&ledgerUUID)
 		is.NoErr(err)
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking')`, ledgerUUID).Scan(&checkingUUID)
 		is.NoErr(err)
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue')`, ledgerUUID).Scan(&revenueUUID)
 		is.NoErr(err)
 
 		// seed + reserve
@@ -1197,9 +1208,9 @@ func TestLedgerCRUD(t *testing.T) {
 		var ledgerUUID, checkingUUID, revenueUUID string
 		err := conn.QueryRow(ctx, `select ledger.create_ledger('Rebuild Test')`).Scan(&ledgerUUID)
 		is.NoErr(err)
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking')`, ledgerUUID).Scan(&checkingUUID)
 		is.NoErr(err)
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue')`, ledgerUUID).Scan(&revenueUUID)
 		is.NoErr(err)
 
 		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 50000, '2025-03-01', 'First')`, ledgerUUID, checkingUUID, revenueUUID)
@@ -1209,7 +1220,7 @@ func TestLedgerCRUD(t *testing.T) {
 
 		// verify correct balance before rebuild
 		var balanceBefore int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
+		err = conn.QueryRow(ctx, `select debits_total from ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
 		is.NoErr(err)
 		is.Equal(balanceBefore, int64(80000))
 
@@ -1219,7 +1230,7 @@ func TestLedgerCRUD(t *testing.T) {
 
 		// verify balance is now wrong
 		var corruptedBalance int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&corruptedBalance)
+		err = conn.QueryRow(ctx, `select debits_total from ledger.get_balance($1)`, checkingUUID).Scan(&corruptedBalance)
 		is.NoErr(err)
 		is.Equal(corruptedBalance, int64(0)) // corrupted
 
@@ -1229,7 +1240,7 @@ func TestLedgerCRUD(t *testing.T) {
 
 		// verify balance is restored
 		var balanceAfter int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
+		err = conn.QueryRow(ctx, `select debits_total from ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
 		is.NoErr(err)
 		is.Equal(balanceAfter, int64(80000)) // restored
 
@@ -1266,9 +1277,9 @@ func TestTwoPhaseTransfers(t *testing.T) {
 	var ledgerUUID, checkingUUID, revenueUUID string
 	err = conn.QueryRow(ctx, `select ledger.create_ledger('Two Phase Test')`).Scan(&ledgerUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking')`, ledgerUUID).Scan(&checkingUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue')`, ledgerUUID).Scan(&revenueUUID)
 	is.NoErr(err)
 
 	// seed with posted balance so we have something to work with
@@ -1299,7 +1310,7 @@ func TestTwoPhaseTransfers(t *testing.T) {
 
 		// verify posted counters NOT updated (still at seed values)
 		var balance int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balance)
+		err = conn.QueryRow(ctx, `select debits_total from ledger.get_balance($1)`, checkingUUID).Scan(&balance)
 		is.NoErr(err)
 		is.Equal(balance, int64(100000)) // unchanged
 	})
@@ -1316,7 +1327,7 @@ func TestTwoPhaseTransfers(t *testing.T) {
 
 		// get balance before commit
 		var balanceBefore int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
+		err = conn.QueryRow(ctx, `select debits_total from ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
 		is.NoErr(err)
 
 		// commit
@@ -1339,7 +1350,7 @@ func TestTwoPhaseTransfers(t *testing.T) {
 
 		// verify posted balance updated
 		var balanceAfter int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
+		err = conn.QueryRow(ctx, `select debits_total from ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
 		is.NoErr(err)
 		is.Equal(balanceAfter, balanceBefore+10000)
 
@@ -1362,7 +1373,7 @@ func TestTwoPhaseTransfers(t *testing.T) {
 
 		// get balance before
 		var balanceBefore int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
+		err = conn.QueryRow(ctx, `select debits_total from ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
 		is.NoErr(err)
 
 		// release
@@ -1383,7 +1394,7 @@ func TestTwoPhaseTransfers(t *testing.T) {
 
 		// verify balance unchanged
 		var balanceAfter int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
+		err = conn.QueryRow(ctx, `select debits_total from ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
 		is.NoErr(err)
 		is.Equal(balanceBefore, balanceAfter)
 	})
@@ -1392,7 +1403,7 @@ func TestTwoPhaseTransfers(t *testing.T) {
 		is := is_.New(t)
 
 		var balanceBefore int64
-		err := conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
+		err := conn.QueryRow(ctx, `select debits_total from ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
 		is.NoErr(err)
 
 		// reserve 20000
@@ -1414,7 +1425,7 @@ func TestTwoPhaseTransfers(t *testing.T) {
 
 		// balance changed by 12000 (not 20000)
 		var balanceAfter int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
+		err = conn.QueryRow(ctx, `select debits_total from ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
 		is.NoErr(err)
 		is.Equal(balanceAfter, balanceBefore+12000)
 	})
@@ -1465,12 +1476,12 @@ func TestTwoPhaseTransfers(t *testing.T) {
 		// create constrained account with credits_must_not_exceed_debits
 		var constrainedUUID, otherUUID string
 		err := conn.QueryRow(ctx, `
-			select ledger.create_account($1, 'Constrained 2P', 'asset', null, false, true)
+			select ledger.create_account($1, 'Constrained 2P', null, false, true)
 		`, ledgerUUID).Scan(&constrainedUUID)
 		is.NoErr(err)
 
 		err = conn.QueryRow(ctx, `
-			select ledger.create_account($1, 'Other 2P', 'equity')
+			select ledger.create_account($1, 'Other 2P')
 		`, ledgerUUID).Scan(&otherUUID)
 		is.NoErr(err)
 
@@ -1563,9 +1574,9 @@ func TestIdempotency(t *testing.T) {
 	var ledgerUUID, checkingUUID, revenueUUID string
 	err = conn.QueryRow(ctx, `select ledger.create_ledger('Idempotency Test')`).Scan(&ledgerUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking')`, ledgerUUID).Scan(&checkingUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue')`, ledgerUUID).Scan(&revenueUUID)
 	is.NoErr(err)
 
 	t.Run("PostWithKey", func(t *testing.T) {
@@ -1661,9 +1672,9 @@ func TestIdempotency(t *testing.T) {
 		var freshLedger, freshChecking, freshRevenue string
 		err := conn.QueryRow(ctx, `select ledger.create_ledger('Balance Dedup Test')`).Scan(&freshLedger)
 		is.NoErr(err)
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, freshLedger).Scan(&freshChecking)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking')`, freshLedger).Scan(&freshChecking)
 		is.NoErr(err)
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, freshLedger).Scan(&freshRevenue)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue')`, freshLedger).Scan(&freshRevenue)
 		is.NoErr(err)
 
 		// post with key
@@ -1680,7 +1691,7 @@ func TestIdempotency(t *testing.T) {
 
 		// balance should be 25000, not 50000
 		var balance int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, freshChecking).Scan(&balance)
+		err = conn.QueryRow(ctx, `select debits_total from ledger.get_balance($1)`, freshChecking).Scan(&balance)
 		is.NoErr(err)
 		is.Equal(balance, int64(25000)) // not doubled
 	})
@@ -1708,13 +1719,13 @@ func TestBalanceConstraints(t *testing.T) {
 		// create asset account with credits_must_not_exceed_debits (can't spend more than you have)
 		var checkingUUID, revenueUUID string
 		err := conn.QueryRow(ctx, `
-			select ledger.create_account($1, 'No Overdraft Checking', 'asset',
+			select ledger.create_account($1, 'No Overdraft Checking',
 				null, false, true)
 		`, ledgerUUID).Scan(&checkingUUID)
 		is.NoErr(err)
 
 		err = conn.QueryRow(ctx, `
-			select ledger.create_account($1, 'Revenue A', 'equity')
+			select ledger.create_account($1, 'Revenue A')
 		`, ledgerUUID).Scan(&revenueUUID)
 		is.NoErr(err)
 
@@ -1743,13 +1754,13 @@ func TestBalanceConstraints(t *testing.T) {
 		// create equity account with debits_must_not_exceed_credits (can't withdraw more than funded)
 		var categoryUUID, fundingUUID string
 		err := conn.QueryRow(ctx, `
-			select ledger.create_account($1, 'Capped Category', 'equity',
+			select ledger.create_account($1, 'Capped Category',
 				null, true, false)
 		`, ledgerUUID).Scan(&categoryUUID)
 		is.NoErr(err)
 
 		err = conn.QueryRow(ctx, `
-			select ledger.create_account($1, 'Funding Source', 'equity')
+			select ledger.create_account($1, 'Funding Source')
 		`, ledgerUUID).Scan(&fundingUUID)
 		is.NoErr(err)
 
@@ -1778,12 +1789,12 @@ func TestBalanceConstraints(t *testing.T) {
 		// default account: no constraints, negative balance allowed
 		var acctUUID, otherUUID string
 		err := conn.QueryRow(ctx, `
-			select ledger.create_account($1, 'Unconstrained', 'asset')
+			select ledger.create_account($1, 'Unconstrained')
 		`, ledgerUUID).Scan(&acctUUID)
 		is.NoErr(err)
 
 		err = conn.QueryRow(ctx, `
-			select ledger.create_account($1, 'Other', 'equity')
+			select ledger.create_account($1, 'Other')
 		`, ledgerUUID).Scan(&otherUUID)
 		is.NoErr(err)
 
@@ -1793,11 +1804,11 @@ func TestBalanceConstraints(t *testing.T) {
 		`, ledgerUUID, otherUUID, acctUUID)
 		is.NoErr(err)
 
-		// balance is -99999 for asset (debits 0 - credits 99999)
-		var balance int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, acctUUID).Scan(&balance)
+		// raw counters: debits=0 credits=99999
+		debits, credits, err := getBalance(ctx, conn, acctUUID)
 		is.NoErr(err)
-		is.Equal(balance, int64(-99999))
+		is.Equal(debits, int64(0))
+		is.Equal(credits, int64(99999))
 	})
 
 	t.Run("ConstraintOnlyAffectsConstrainedAccount", func(t *testing.T) {
@@ -1807,12 +1818,12 @@ func TestBalanceConstraints(t *testing.T) {
 		// the unconstrained side should not be affected
 		var constrainedUUID, freeUUID string
 		err := conn.QueryRow(ctx, `
-			select ledger.create_account($1, 'Constrained Acct', 'equity', null, true, false)
+			select ledger.create_account($1, 'Constrained Acct', null, true, false)
 		`, ledgerUUID).Scan(&constrainedUUID)
 		is.NoErr(err)
 
 		err = conn.QueryRow(ctx, `
-			select ledger.create_account($1, 'Free Acct', 'equity')
+			select ledger.create_account($1, 'Free Acct')
 		`, ledgerUUID).Scan(&freeUUID)
 		is.NoErr(err)
 
@@ -1834,9 +1845,9 @@ func TestBalanceConstraints(t *testing.T) {
 
 		// two unconstrained accounts — should use fast path
 		var aUUID, bUUID string
-		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Fast A', 'asset')`, ledgerUUID).Scan(&aUUID)
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Fast A')`, ledgerUUID).Scan(&aUUID)
 		is.NoErr(err)
-		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Fast B', 'equity')`, ledgerUUID).Scan(&bUUID)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Fast B')`, ledgerUUID).Scan(&bUUID)
 		is.NoErr(err)
 
 		var txUUID string
@@ -1848,7 +1859,7 @@ func TestBalanceConstraints(t *testing.T) {
 
 		// verify counters and balance history still work
 		var balance int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, aUUID).Scan(&balance)
+		err = conn.QueryRow(ctx, `select debits_total from ledger.get_balance($1)`, aUUID).Scan(&balance)
 		is.NoErr(err)
 		is.Equal(balance, int64(50000))
 	})
@@ -1858,12 +1869,12 @@ func TestBalanceConstraints(t *testing.T) {
 
 		var cappedUUID, sourceUUID string
 		err := conn.QueryRow(ctx, `
-			select ledger.create_account($1, 'Batch Capped', 'equity', null, true, false)
+			select ledger.create_account($1, 'Batch Capped', null, true, false)
 		`, ledgerUUID).Scan(&cappedUUID)
 		is.NoErr(err)
 
 		err = conn.QueryRow(ctx, `
-			select ledger.create_account($1, 'Batch Source', 'equity')
+			select ledger.create_account($1, 'Batch Source')
 		`, ledgerUUID).Scan(&sourceUUID)
 		is.NoErr(err)
 
@@ -1882,11 +1893,11 @@ func TestBalanceConstraints(t *testing.T) {
 		]`, cappedUUID, sourceUUID, cappedUUID, sourceUUID))
 		is.True(err != nil) // whole batch rejected
 
-		// balance unchanged — atomic rollback
-		var balance int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, cappedUUID).Scan(&balance)
+		// credits unchanged — atomic rollback
+		debits, credits, err := getBalance(ctx, conn, cappedUUID)
 		is.NoErr(err)
-		is.Equal(balance, int64(1000)) // unchanged
+		is.Equal(debits, int64(0))
+		is.Equal(credits, int64(1000)) // unchanged
 	})
 }
 
@@ -1906,11 +1917,11 @@ func TestPostTransactions(t *testing.T) {
 
 	err = conn.QueryRow(ctx, `select ledger.create_ledger('Batch Test')`).Scan(&ledgerUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking', 'asset')`, ledgerUUID).Scan(&checkingUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Checking')`, ledgerUUID).Scan(&checkingUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Savings', 'asset')`, ledgerUUID).Scan(&savingsUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Savings')`, ledgerUUID).Scan(&savingsUUID)
 	is.NoErr(err)
-	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue', 'equity')`, ledgerUUID).Scan(&revenueUUID)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Revenue')`, ledgerUUID).Scan(&revenueUUID)
 	is.NoErr(err)
 
 	t.Run("BatchOfThree", func(t *testing.T) {
@@ -1934,34 +1945,37 @@ func TestPostTransactions(t *testing.T) {
 	t.Run("BalancesCorrectAfterBatch", func(t *testing.T) {
 		is := is_.New(t)
 
-		// checking: debited 100000 + 50000, credited 30000 → 120000
-		var balance int64
-		err := conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balance)
+		// checking: debited 100000+50000=150000, credited 30000
+		debits, credits, err := getBalance(ctx, conn, checkingUUID)
 		is.NoErr(err)
-		is.Equal(balance, int64(120000))
+		is.Equal(debits, int64(150000))
+		is.Equal(credits, int64(30000))
 
-		// savings: debited 30000 → 30000
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, savingsUUID).Scan(&balance)
+		// savings: debited 30000
+		debits, credits, err = getBalance(ctx, conn, savingsUUID)
 		is.NoErr(err)
-		is.Equal(balance, int64(30000))
+		is.Equal(debits, int64(30000))
+		is.Equal(credits, int64(0))
 
-		// revenue: credited 150000 → 150000
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, revenueUUID).Scan(&balance)
+		// revenue: credited 150000
+		debits, credits, err = getBalance(ctx, conn, revenueUUID)
 		is.NoErr(err)
-		is.Equal(balance, int64(150000))
+		is.Equal(debits, int64(0))
+		is.Equal(credits, int64(150000))
 	})
 
 	t.Run("BalanceHistoryIsSequential", func(t *testing.T) {
 		is := is_.New(t)
 
-		// checking has 3 transactions — running balances should be sequential, not all the same
+		// checking has 3 transactions — counters should be sequential
 		type historyRow struct {
-			Amount         int64
-			RunningBalance int64
+			Amount       int64
+			DebitsTotal  int64
+			CreditsTotal int64
 		}
 
 		rows, err := conn.Query(ctx, `
-			select amount, running_balance from ledger.get_history($1)
+			select amount, debits_total, credits_total from ledger.get_history($1)
 		`, checkingUUID)
 		is.NoErr(err)
 		defer rows.Close()
@@ -1969,17 +1983,17 @@ func TestPostTransactions(t *testing.T) {
 		var history []historyRow
 		for rows.Next() {
 			var h historyRow
-			err := rows.Scan(&h.Amount, &h.RunningBalance)
+			err := rows.Scan(&h.Amount, &h.DebitsTotal, &h.CreditsTotal)
 			is.NoErr(err)
 			history = append(history, h)
 		}
 		is.NoErr(rows.Err())
 
 		is.Equal(len(history), 3)
-		// newest first
-		is.Equal(history[0].RunningBalance, int64(120000)) // after freelance
-		is.Equal(history[1].RunningBalance, int64(70000))  // after savings transfer
-		is.Equal(history[2].RunningBalance, int64(100000)) // after paycheck
+		// newest first — raw counters
+		is.Equal(history[0].DebitsTotal, int64(150000)) // after freelance
+		is.Equal(history[1].DebitsTotal, int64(100000)) // after savings transfer (credit, debits unchanged)
+		is.Equal(history[2].DebitsTotal, int64(100000)) // after paycheck
 	})
 
 	t.Run("EmptyArray", func(t *testing.T) {
@@ -2019,7 +2033,7 @@ func TestPostTransactions(t *testing.T) {
 
 		// get balance before
 		var balanceBefore int64
-		err := conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
+		err := conn.QueryRow(ctx, `select debits_total from ledger.get_balance($1)`, checkingUUID).Scan(&balanceBefore)
 		is.NoErr(err)
 
 		// batch with one good + one bad — should all roll back
@@ -2033,7 +2047,7 @@ func TestPostTransactions(t *testing.T) {
 
 		// balance should be unchanged
 		var balanceAfter int64
-		err = conn.QueryRow(ctx, `select ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
+		err = conn.QueryRow(ctx, `select debits_total from ledger.get_balance($1)`, checkingUUID).Scan(&balanceAfter)
 		is.NoErr(err)
 		is.Equal(balanceBefore, balanceAfter) // no change — batch rolled back
 	})
