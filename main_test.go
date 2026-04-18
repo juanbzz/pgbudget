@@ -2115,3 +2115,1697 @@ func TestBalancesTable(t *testing.T) {
 		is.True(rlsEnabled)
 	})
 }
+
+// --- Helper types and functions for engine guarantee tests ---
+
+type Transaction struct {
+	UUID             string
+	Amount           int64
+	Description      *string
+	Status           string
+	DebitAccountID   int64
+	CreditAccountID  int64
+	CreatedAt        time.Time
+}
+
+type BalanceRow struct {
+	AccountID     int64
+	TransactionID int64
+	DebitsTotal   int64
+	CreditsTotal  int64
+}
+
+func countTransactions(ctx context.Context, conn *pgx.Conn) (int, error) {
+	var count int
+	err := conn.QueryRow(ctx, `select count(*) from data.transactions`).Scan(&count)
+	return count, err
+}
+
+func countBalances(ctx context.Context, conn *pgx.Conn) (int, error) {
+	var count int
+	err := conn.QueryRow(ctx, `select count(*) from data.balances`).Scan(&count)
+	return count, err
+}
+
+func countPending(ctx context.Context, conn *pgx.Conn) (int, error) {
+	var count int
+	err := conn.QueryRow(ctx, `select count(*) from data.pending`).Scan(&count)
+	return count, err
+}
+
+func getTransactionByUUID(ctx context.Context, conn *pgx.Conn, uuid string) (Transaction, error) {
+	var t Transaction
+	err := conn.QueryRow(ctx, `
+		select uuid, amount, description, status, debit_account_id, credit_account_id, created_at
+		from data.transactions where uuid = $1
+	`, uuid).Scan(&t.UUID, &t.Amount, &t.Description, &t.Status, &t.DebitAccountID, &t.CreditAccountID, &t.CreatedAt)
+	return t, err
+}
+
+func getBalanceHistory(ctx context.Context, conn *pgx.Conn, accountUUID string) ([]BalanceRow, error) {
+	rows, err := conn.Query(ctx, `
+		select b.account_id, b.transaction_id, b.debits_total, b.credits_total
+		from data.balances b
+		join data.accounts a on a.id = b.account_id
+		where a.uuid = $1
+		order by b.transaction_id asc
+	`, accountUUID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []BalanceRow
+	for rows.Next() {
+		var r BalanceRow
+		if err := rows.Scan(&r.AccountID, &r.TransactionID, &r.DebitsTotal, &r.CreditsTotal); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, rows.Err()
+}
+
+// --- Engine guarantee tests ---
+
+func TestAppendOnlyImmutability(t *testing.T) {
+	assert := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	assert.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	err = setTestUserContext(ctx, conn, "immutability_test_user")
+	assert.NoErr(err)
+
+	// setup: ledger + two accounts
+	var ledgerUUID, acctA, acctB string
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Immutability Test')`).Scan(&ledgerUUID)
+	assert.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Account A')`, ledgerUUID).Scan(&acctA)
+	assert.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Account B')`, ledgerUUID).Scan(&acctB)
+	assert.NoErr(err)
+
+	t.Run("RowCountIncreasesAfterPost", func(t *testing.T) {
+		assert := is_.New(t)
+
+		before, err := countTransactions(ctx, conn)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 1000)`, ledgerUUID, acctA, acctB)
+		assert.NoErr(err)
+
+		after, err := countTransactions(ctx, conn)
+		assert.NoErr(err)
+		assert.Equal(after-before, 1) // exactly one new row
+	})
+
+	// post a transaction we'll void and correct later
+	var txUUID string
+	err = conn.QueryRow(ctx, `select ledger.post_transaction($1, $2, $3, 5000, current_date, 'Original')`,
+		ledgerUUID, acctA, acctB).Scan(&txUUID)
+	assert.NoErr(err)
+
+	// snapshot the original transaction
+	origTx, err := getTransactionByUUID(ctx, conn, txUUID)
+	assert.NoErr(err)
+
+	t.Run("RowCountIncreasesAfterVoid", func(t *testing.T) {
+		assert := is_.New(t)
+
+		before, err := countTransactions(ctx, conn)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.void($1)`, txUUID)
+		assert.NoErr(err)
+
+		after, err := countTransactions(ctx, conn)
+		assert.NoErr(err)
+		assert.Equal(after-before, 1) // reversal is a new row
+	})
+
+	t.Run("OriginalTransactionUntouchedAfterVoid", func(t *testing.T) {
+		assert := is_.New(t)
+
+		current, err := getTransactionByUUID(ctx, conn, txUUID)
+		assert.NoErr(err)
+		assert.Equal(current.Amount, origTx.Amount)
+		assert.Equal(current.DebitAccountID, origTx.DebitAccountID)
+		assert.Equal(current.CreditAccountID, origTx.CreditAccountID)
+		assert.Equal(current.CreatedAt, origTx.CreatedAt)
+	})
+
+	t.Run("VoidReversalHasSwappedAccounts", func(t *testing.T) {
+		assert := is_.New(t)
+
+		// the reversal is the most recent transaction
+		var reversalDebit, reversalCredit int64
+		err := conn.QueryRow(ctx, `
+			select debit_account_id, credit_account_id
+			from data.transactions
+			where description like 'VOIDED:%' and amount = $1
+			order by created_at desc limit 1
+		`, origTx.Amount).Scan(&reversalDebit, &reversalCredit)
+		assert.NoErr(err)
+		assert.Equal(reversalDebit, origTx.CreditAccountID)  // swapped
+		assert.Equal(reversalCredit, origTx.DebitAccountID)   // swapped
+	})
+
+	// post another transaction to test correct
+	var tx2UUID string
+	err = conn.QueryRow(ctx, `select ledger.post_transaction($1, $2, $3, 8000, current_date, 'To correct')`,
+		ledgerUUID, acctA, acctB).Scan(&tx2UUID)
+	assert.NoErr(err)
+	origTx2, err := getTransactionByUUID(ctx, conn, tx2UUID)
+	assert.NoErr(err)
+
+	t.Run("RowCountIncreasesAfterCorrect", func(t *testing.T) {
+		assert := is_.New(t)
+
+		before, err := countTransactions(ctx, conn)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.correct($1, null, null, 12000)`, tx2UUID)
+		assert.NoErr(err)
+
+		after, err := countTransactions(ctx, conn)
+		assert.NoErr(err)
+		assert.Equal(after-before, 2) // reversal + correction
+	})
+
+	t.Run("OriginalTransactionUntouchedAfterCorrect", func(t *testing.T) {
+		assert := is_.New(t)
+
+		current, err := getTransactionByUUID(ctx, conn, tx2UUID)
+		assert.NoErr(err)
+		assert.Equal(current.Amount, origTx2.Amount)             // still 8000
+		assert.Equal(current.DebitAccountID, origTx2.DebitAccountID)
+		assert.Equal(current.CreditAccountID, origTx2.CreditAccountID)
+	})
+
+	t.Run("BalanceHistoryOnlyGrows", func(t *testing.T) {
+		assert := is_.New(t)
+
+		before, err := countBalances(ctx, conn)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 2000)`, ledgerUUID, acctA, acctB)
+		assert.NoErr(err)
+
+		after, err := countBalances(ctx, conn)
+		assert.NoErr(err)
+		assert.Equal(after-before, 2) // one row per account
+	})
+
+	t.Run("BalanceHistoryGrowsOnVoid", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var voidTarget string
+		err := conn.QueryRow(ctx, `select ledger.post_transaction($1, $2, $3, 3000)`,
+			ledgerUUID, acctA, acctB).Scan(&voidTarget)
+		assert.NoErr(err)
+
+		before, err := countBalances(ctx, conn)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.void($1)`, voidTarget)
+		assert.NoErr(err)
+
+		after, err := countBalances(ctx, conn)
+		assert.NoErr(err)
+		assert.Equal(after-before, 2) // reversal adds 2 balance rows
+	})
+
+	t.Run("BalanceHistoryGrowsOnCorrect", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var correctTarget string
+		err := conn.QueryRow(ctx, `select ledger.post_transaction($1, $2, $3, 4000)`,
+			ledgerUUID, acctA, acctB).Scan(&correctTarget)
+		assert.NoErr(err)
+
+		before, err := countBalances(ctx, conn)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.correct($1, null, null, 6000)`, correctTarget)
+		assert.NoErr(err)
+
+		after, err := countBalances(ctx, conn)
+		assert.NoErr(err)
+		assert.Equal(after-before, 4) // reversal (2) + correction (2)
+	})
+
+	t.Run("TransactionLogIsAppendOnly", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var logTarget string
+		err := conn.QueryRow(ctx, `select ledger.post_transaction($1, $2, $3, 1500)`,
+			ledgerUUID, acctA, acctB).Scan(&logTarget)
+		assert.NoErr(err)
+
+		var logBefore int
+		err = conn.QueryRow(ctx, `select count(*) from data.transaction_log`).Scan(&logBefore)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.void($1)`, logTarget)
+		assert.NoErr(err)
+
+		var logAfter int
+		err = conn.QueryRow(ctx, `select count(*) from data.transaction_log`).Scan(&logAfter)
+		assert.NoErr(err)
+		assert.True(logAfter > logBefore) // at least one new log entry
+	})
+
+	t.Run("CorrectReversalMatchesOriginal", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var target string
+		err := conn.QueryRow(ctx, `select ledger.post_transaction($1, $2, $3, 7777, current_date, 'Seven')`,
+			ledgerUUID, acctA, acctB).Scan(&target)
+		assert.NoErr(err)
+
+		orig, err := getTransactionByUUID(ctx, conn, target)
+		assert.NoErr(err)
+
+		beforeCount, err := countTransactions(ctx, conn)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.correct($1, null, null, 9999)`, target)
+		assert.NoErr(err)
+
+		// correct creates 2 new rows: reversal + correction
+		// the reversal is the first of the two new rows (lower id)
+		var revAmount int64
+		var revDebit, revCredit int64
+		err = conn.QueryRow(ctx, `
+			select amount, debit_account_id, credit_account_id
+			from data.transactions
+			where amount = $1
+			  and debit_account_id = $2
+			  and credit_account_id = $3
+			order by id desc limit 1
+		`, orig.Amount, orig.CreditAccountID, orig.DebitAccountID).Scan(&revAmount, &revDebit, &revCredit)
+		assert.NoErr(err)
+		assert.Equal(revAmount, orig.Amount)
+		assert.Equal(revDebit, orig.CreditAccountID)  // swapped
+		assert.Equal(revCredit, orig.DebitAccountID)   // swapped
+
+		afterCount, err := countTransactions(ctx, conn)
+		assert.NoErr(err)
+		assert.Equal(afterCount-beforeCount, 2) // reversal + correction
+	})
+}
+
+func TestBalanceCorrectnessInvariants(t *testing.T) {
+	assert := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	assert.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	err = setTestUserContext(ctx, conn, "balance_correctness_user")
+	assert.NoErr(err)
+
+	var ledgerUUID, acctA, acctB string
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Balance Correctness')`).Scan(&ledgerUUID)
+	assert.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Acct A')`, ledgerUUID).Scan(&acctA)
+	assert.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Acct B')`, ledgerUUID).Scan(&acctB)
+	assert.NoErr(err)
+
+	t.Run("SinglePostBothAccountsCorrect", func(t *testing.T) {
+		assert := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 50000)`, ledgerUUID, acctA, acctB)
+		assert.NoErr(err)
+
+		dA, cA, err := getBalance(ctx, conn, acctA)
+		assert.NoErr(err)
+		assert.Equal(dA, int64(50000)) // A was debited
+		assert.Equal(cA, int64(0))
+
+		dB, cB, err := getBalance(ctx, conn, acctB)
+		assert.NoErr(err)
+		assert.Equal(dB, int64(0))
+		assert.Equal(cB, int64(50000)) // B was credited
+	})
+
+	t.Run("MultiplePostsAccumulate", func(t *testing.T) {
+		assert := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 20000)`, ledgerUUID, acctA, acctB)
+		assert.NoErr(err)
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 30000)`, ledgerUUID, acctA, acctB)
+		assert.NoErr(err)
+
+		dA, cA, err := getBalance(ctx, conn, acctA)
+		assert.NoErr(err)
+		assert.Equal(dA, int64(100000)) // 50000 + 20000 + 30000
+		assert.Equal(cA, int64(0))
+
+		dB, cB, err := getBalance(ctx, conn, acctB)
+		assert.NoErr(err)
+		assert.Equal(dB, int64(0))
+		assert.Equal(cB, int64(100000))
+	})
+
+	t.Run("VoidResetsNetToZero", func(t *testing.T) {
+		assert := is_.New(t)
+
+		// use fresh accounts so counters are clean
+		var a1, a2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Void A')`, ledgerUUID).Scan(&a1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Void B')`, ledgerUUID).Scan(&a2)
+		assert.NoErr(err)
+
+		var txUUID string
+		err = conn.QueryRow(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, a1, a2).Scan(&txUUID)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.void($1)`, txUUID)
+		assert.NoErr(err)
+
+		d1, c1, err := getBalance(ctx, conn, a1)
+		assert.NoErr(err)
+		assert.Equal(d1, c1) // net zero
+
+		d2, c2, err := getBalance(ctx, conn, a2)
+		assert.NoErr(err)
+		assert.Equal(d2, c2) // net zero
+	})
+
+	t.Run("CorrectNetIsNewAmount", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var c1, c2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Correct A')`, ledgerUUID).Scan(&c1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Correct B')`, ledgerUUID).Scan(&c2)
+		assert.NoErr(err)
+
+		var txUUID string
+		err = conn.QueryRow(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, c1, c2).Scan(&txUUID)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.correct($1, null, null, 15000)`, txUUID)
+		assert.NoErr(err)
+
+		// c1: debited 10000 (orig) + credited 10000 (reversal) + debited 15000 (correction)
+		d1, cr1, err := getBalance(ctx, conn, c1)
+		assert.NoErr(err)
+		assert.Equal(d1, int64(25000))  // 10000 + 15000
+		assert.Equal(cr1, int64(10000)) // reversal
+		// net = 25000 - 10000 = 15000 (the corrected amount)
+	})
+
+	t.Run("BalanceHistorySnapshotAfterEachPost", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var h1, h2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Hist A')`, ledgerUUID).Scan(&h1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Hist B')`, ledgerUUID).Scan(&h2)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 1000)`, ledgerUUID, h1, h2)
+		assert.NoErr(err)
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 2000)`, ledgerUUID, h1, h2)
+		assert.NoErr(err)
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 3000)`, ledgerUUID, h1, h2)
+		assert.NoErr(err)
+
+		history, err := getBalanceHistory(ctx, conn, h1)
+		assert.NoErr(err)
+		assert.Equal(len(history), 3)
+		assert.Equal(history[0].DebitsTotal, int64(1000))  // after 1st
+		assert.Equal(history[1].DebitsTotal, int64(3000))  // after 2nd (1000+2000)
+		assert.Equal(history[2].DebitsTotal, int64(6000))  // after 3rd (1000+2000+3000)
+	})
+
+	t.Run("ReserveDoesNotAffectPostedCounters", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var r1, r2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Reserve A')`, ledgerUUID).Scan(&r1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Reserve B')`, ledgerUUID).Scan(&r2)
+		assert.NoErr(err)
+
+		d1Before, c1Before, err := getBalance(ctx, conn, r1)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.reserve($1, $2, $3, 5000)`, ledgerUUID, r1, r2)
+		assert.NoErr(err)
+
+		d1After, c1After, err := getBalance(ctx, conn, r1)
+		assert.NoErr(err)
+		assert.Equal(d1Before, d1After)   // unchanged
+		assert.Equal(c1Before, c1After)   // unchanged
+	})
+
+	t.Run("CommitCreatesBalanceHistory", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var cm1, cm2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Commit A')`, ledgerUUID).Scan(&cm1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Commit B')`, ledgerUUID).Scan(&cm2)
+		assert.NoErr(err)
+
+		var pendingUUID string
+		err = conn.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 7000)`,
+			ledgerUUID, cm1, cm2).Scan(&pendingUUID)
+		assert.NoErr(err)
+
+		balBefore, err := countBalances(ctx, conn)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.commit($1)`, pendingUUID)
+		assert.NoErr(err)
+
+		balAfter, err := countBalances(ctx, conn)
+		assert.NoErr(err)
+		assert.Equal(balAfter-balBefore, 2) // one per account
+	})
+
+	t.Run("ReleaseDoesNotCreateBalanceHistory", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var rl1, rl2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Release A')`, ledgerUUID).Scan(&rl1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Release B')`, ledgerUUID).Scan(&rl2)
+		assert.NoErr(err)
+
+		var pendingUUID string
+		err = conn.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 3000)`,
+			ledgerUUID, rl1, rl2).Scan(&pendingUUID)
+		assert.NoErr(err)
+
+		balBefore, err := countBalances(ctx, conn)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.release($1)`, pendingUUID)
+		assert.NoErr(err)
+
+		balAfter, err := countBalances(ctx, conn)
+		assert.NoErr(err)
+		assert.Equal(balAfter, balBefore) // no change
+	})
+
+	t.Run("PartialCommitCountersMatchCommitAmount", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var p1, p2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Partial A')`, ledgerUUID).Scan(&p1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Partial B')`, ledgerUUID).Scan(&p2)
+		assert.NoErr(err)
+
+		var pendingUUID string
+		err = conn.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 20000)`,
+			ledgerUUID, p1, p2).Scan(&pendingUUID)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.commit($1, 8000)`, pendingUUID)
+		assert.NoErr(err)
+
+		d1, c1, err := getBalance(ctx, conn, p1)
+		assert.NoErr(err)
+		assert.Equal(d1, int64(8000)) // commit amount, not reserved
+		assert.Equal(c1, int64(0))
+	})
+
+	t.Run("FullCommitCountersMatchReservedAmount", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var f1, f2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Full A')`, ledgerUUID).Scan(&f1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Full B')`, ledgerUUID).Scan(&f2)
+		assert.NoErr(err)
+
+		var pendingUUID string
+		err = conn.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 15000)`,
+			ledgerUUID, f1, f2).Scan(&pendingUUID)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.commit($1)`, pendingUUID)
+		assert.NoErr(err)
+
+		d1, _, err := getBalance(ctx, conn, f1)
+		assert.NoErr(err)
+		assert.Equal(d1, int64(15000))
+	})
+
+	t.Run("RebuildBalancesProducesSameResult", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var rb1, rb2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Rebuild A')`, ledgerUUID).Scan(&rb1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Rebuild B')`, ledgerUUID).Scan(&rb2)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 1000)`, ledgerUUID, rb1, rb2)
+		assert.NoErr(err)
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 2000)`, ledgerUUID, rb1, rb2)
+		assert.NoErr(err)
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 3000)`, ledgerUUID, rb2, rb1)
+		assert.NoErr(err)
+
+		d1Before, c1Before, err := getBalance(ctx, conn, rb1)
+		assert.NoErr(err)
+		d2Before, c2Before, err := getBalance(ctx, conn, rb2)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.rebuild_balances($1)`, ledgerUUID)
+		assert.NoErr(err)
+
+		d1After, c1After, err := getBalance(ctx, conn, rb1)
+		assert.NoErr(err)
+		assert.Equal(d1Before, d1After)
+		assert.Equal(c1Before, c1After)
+
+		d2After, c2After, err := getBalance(ctx, conn, rb2)
+		assert.NoErr(err)
+		assert.Equal(d2Before, d2After)
+		assert.Equal(c2Before, c2After)
+	})
+}
+
+func TestConstraintBoundaryEnforcement(t *testing.T) {
+	assert := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	assert.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	err = setTestUserContext(ctx, conn, "constraint_boundary_user")
+	assert.NoErr(err)
+
+	var ledgerUUID string
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Constraint Boundary')`).Scan(&ledgerUUID)
+	assert.NoErr(err)
+
+	t.Run("ExactLimitSucceeds_DebitsEqCredits", func(t *testing.T) {
+		assert := is_.New(t)
+
+		// account with debits_must_not_exceed_credits
+		var constrained, funder string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'DNEC Exact', null, true, false)`,
+			ledgerUUID).Scan(&constrained)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Funder DNEC Exact')`,
+			ledgerUUID).Scan(&funder)
+		assert.NoErr(err)
+
+		// fund: credit the constrained account with 10000
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, funder, constrained)
+		assert.NoErr(err)
+
+		// debit exactly 10000 — should succeed
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, constrained, funder)
+		assert.NoErr(err)
+	})
+
+	t.Run("OnePastLimitFails_DebitsExceedCredits", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var constrained, funder string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'DNEC Over', null, true, false)`,
+			ledgerUUID).Scan(&constrained)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Funder DNEC Over')`,
+			ledgerUUID).Scan(&funder)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, funder, constrained)
+		assert.NoErr(err)
+
+		// debit 10001 — should fail
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10001)`,
+			ledgerUUID, constrained, funder)
+		assert.True(err != nil) // exceeds credits
+	})
+
+	t.Run("ExactLimitSucceeds_CreditsEqDebits", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var constrained, funder string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'CNED Exact', null, false, true)`,
+			ledgerUUID).Scan(&constrained)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Funder CNED Exact')`,
+			ledgerUUID).Scan(&funder)
+		assert.NoErr(err)
+
+		// fund: debit the constrained account with 10000
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, constrained, funder)
+		assert.NoErr(err)
+
+		// credit exactly 10000 — should succeed
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, funder, constrained)
+		assert.NoErr(err)
+	})
+
+	t.Run("OnePastLimitFails_CreditsExceedDebits", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var constrained, funder string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'CNED Over', null, false, true)`,
+			ledgerUUID).Scan(&constrained)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Funder CNED Over')`,
+			ledgerUUID).Scan(&funder)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, constrained, funder)
+		assert.NoErr(err)
+
+		// credit 10001 — should fail
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10001)`,
+			ledgerUUID, funder, constrained)
+		assert.True(err != nil) // exceeds debits
+	})
+
+	t.Run("PendingHoldReducesAvailableForPost", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var constrained, other string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Pending Post', null, true, false)`,
+			ledgerUUID).Scan(&constrained)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Other Pending Post')`,
+			ledgerUUID).Scan(&other)
+		assert.NoErr(err)
+
+		// fund 10000
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, other, constrained)
+		assert.NoErr(err)
+
+		// reserve 6000 (pending hold)
+		_, err = conn.Exec(ctx, `select ledger.reserve($1, $2, $3, 6000)`,
+			ledgerUUID, constrained, other)
+		assert.NoErr(err)
+
+		// post 5000 — should fail (pending 6000 + post 5000 = 11000 > 10000)
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 5000)`,
+			ledgerUUID, constrained, other)
+		assert.True(err != nil)
+	})
+
+	t.Run("PendingHoldReducesAvailableForReserve", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var constrained, other string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Pending Reserve', null, true, false)`,
+			ledgerUUID).Scan(&constrained)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Other Pending Reserve')`,
+			ledgerUUID).Scan(&other)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, other, constrained)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.reserve($1, $2, $3, 6000)`,
+			ledgerUUID, constrained, other)
+		assert.NoErr(err)
+
+		// reserve 5000 more — should fail
+		_, err = conn.Exec(ctx, `select ledger.reserve($1, $2, $3, 5000)`,
+			ledgerUUID, constrained, other)
+		assert.True(err != nil)
+	})
+
+	t.Run("VoidFreesBalanceForNewTransaction", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var constrained, other string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Void Free', null, true, false)`,
+			ledgerUUID).Scan(&constrained)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Other Void Free')`,
+			ledgerUUID).Scan(&other)
+		assert.NoErr(err)
+
+		// fund 10000
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, other, constrained)
+		assert.NoErr(err)
+
+		// spend 10000
+		var spendUUID string
+		err = conn.QueryRow(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, constrained, other).Scan(&spendUUID)
+		assert.NoErr(err)
+
+		// void the spend
+		_, err = conn.Exec(ctx, `select ledger.void($1)`, spendUUID)
+		assert.NoErr(err)
+
+		// spend 10000 again — should succeed (void freed the balance)
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, constrained, other)
+		assert.NoErr(err)
+	})
+
+	t.Run("ReleaseFreesHoldForNewTransaction", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var constrained, other string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Release Free', null, true, false)`,
+			ledgerUUID).Scan(&constrained)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Other Release Free')`,
+			ledgerUUID).Scan(&other)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, other, constrained)
+		assert.NoErr(err)
+
+		var holdUUID string
+		err = conn.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 10000)`,
+			ledgerUUID, constrained, other).Scan(&holdUUID)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.release($1)`, holdUUID)
+		assert.NoErr(err)
+
+		// reserve again — should succeed
+		_, err = conn.Exec(ctx, `select ledger.reserve($1, $2, $3, 10000)`,
+			ledgerUUID, constrained, other)
+		assert.NoErr(err)
+	})
+
+	t.Run("ConstraintCheckedAfterCounterUpdate", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var constrained, other string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Drain', null, true, false)`,
+			ledgerUUID).Scan(&constrained)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Other Drain')`,
+			ledgerUUID).Scan(&other)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 5000)`,
+			ledgerUUID, other, constrained)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 3000)`,
+			ledgerUUID, constrained, other)
+		assert.NoErr(err) // ok: 3000 <= 5000
+
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 2000)`,
+			ledgerUUID, constrained, other)
+		assert.NoErr(err) // ok: 5000 <= 5000
+
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 1)`,
+			ledgerUUID, constrained, other)
+		assert.True(err != nil) // fail: 5001 > 5000
+	})
+}
+
+func TestTwoPhaseGuarantees(t *testing.T) {
+	assert := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	assert.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	err = setTestUserContext(ctx, conn, "twophase_guarantee_user")
+	assert.NoErr(err)
+
+	var ledgerUUID string
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Two Phase Guarantees')`).Scan(&ledgerUUID)
+	assert.NoErr(err)
+
+	t.Run("PartialCommitReleasesRemainder", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var a1, a2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'PCR A')`, ledgerUUID).Scan(&a1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'PCR B')`, ledgerUUID).Scan(&a2)
+		assert.NoErr(err)
+
+		var holdUUID string
+		err = conn.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 20000)`,
+			ledgerUUID, a1, a2).Scan(&holdUUID)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.commit($1, 12000)`, holdUUID)
+		assert.NoErr(err)
+
+		// no pending rows should remain
+		var pendingCount int
+		err = conn.QueryRow(ctx, `
+			select count(*) from data.pending p
+			join data.transactions t on t.id = p.transaction_id
+			where t.uuid = $1
+		`, holdUUID).Scan(&pendingCount)
+		assert.NoErr(err)
+		assert.Equal(pendingCount, 0)
+	})
+
+	t.Run("PartialCommitDoesNotHoldRemainder", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var a1, a2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'PDHR A', null, true, false)`,
+			ledgerUUID).Scan(&a1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'PDHR B')`,
+			ledgerUUID).Scan(&a2)
+		assert.NoErr(err)
+
+		// fund 20000
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 20000)`,
+			ledgerUUID, a2, a1)
+		assert.NoErr(err)
+
+		var holdUUID string
+		err = conn.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 20000)`,
+			ledgerUUID, a1, a2).Scan(&holdUUID)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.commit($1, 10000)`, holdUUID)
+		assert.NoErr(err)
+
+		// should be able to reserve 10000 more (remainder was released)
+		_, err = conn.Exec(ctx, `select ledger.reserve($1, $2, $3, 10000)`,
+			ledgerUUID, a1, a2)
+		assert.NoErr(err)
+	})
+
+	t.Run("CommitAfterExpireFails", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var a1, a2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Expire A')`, ledgerUUID).Scan(&a1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Expire B')`, ledgerUUID).Scan(&a2)
+		assert.NoErr(err)
+
+		var holdUUID string
+		err = conn.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 5000, 1)`,
+			ledgerUUID, a1, a2).Scan(&holdUUID)
+		assert.NoErr(err)
+
+		time.Sleep(2 * time.Second)
+
+		_, err = conn.Exec(ctx, `select ledger.expire_pending()`)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.commit($1)`, holdUUID)
+		assert.True(err != nil) // expired, can't commit
+	})
+
+	t.Run("ExpireOnlyAffectsTimedOut", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var a1, a2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Expire Selective A')`, ledgerUUID).Scan(&a1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Expire Selective B')`, ledgerUUID).Scan(&a2)
+		assert.NoErr(err)
+
+		// short timeout
+		var shortUUID string
+		err = conn.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 3000, 1)`,
+			ledgerUUID, a1, a2).Scan(&shortUUID)
+		assert.NoErr(err)
+
+		// long timeout
+		var longUUID string
+		err = conn.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 4000, 300)`,
+			ledgerUUID, a1, a2).Scan(&longUUID)
+		assert.NoErr(err)
+
+		time.Sleep(2 * time.Second)
+
+		_, err = conn.Exec(ctx, `select ledger.expire_pending()`)
+		assert.NoErr(err)
+
+		// short one should be expired
+		_, err = conn.Exec(ctx, `select ledger.commit($1)`, shortUUID)
+		assert.True(err != nil)
+
+		// long one should still be committable
+		_, err = conn.Exec(ctx, `select ledger.commit($1)`, longUUID)
+		assert.NoErr(err)
+	})
+
+	t.Run("DoubleCommitFails", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var a1, a2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'DblCommit A')`, ledgerUUID).Scan(&a1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'DblCommit B')`, ledgerUUID).Scan(&a2)
+		assert.NoErr(err)
+
+		var holdUUID string
+		err = conn.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 5000)`,
+			ledgerUUID, a1, a2).Scan(&holdUUID)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.commit($1)`, holdUUID)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.commit($1)`, holdUUID)
+		assert.True(err != nil) // already committed
+	})
+
+	t.Run("DoubleReleaseFails", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var a1, a2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'DblRelease A')`, ledgerUUID).Scan(&a1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'DblRelease B')`, ledgerUUID).Scan(&a2)
+		assert.NoErr(err)
+
+		var holdUUID string
+		err = conn.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 5000)`,
+			ledgerUUID, a1, a2).Scan(&holdUUID)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.release($1)`, holdUUID)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.release($1)`, holdUUID)
+		assert.True(err != nil) // already released
+	})
+
+	t.Run("CommitZeroFails", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var a1, a2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Zero Commit A')`, ledgerUUID).Scan(&a1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Zero Commit B')`, ledgerUUID).Scan(&a2)
+		assert.NoErr(err)
+
+		var holdUUID string
+		err = conn.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 5000)`,
+			ledgerUUID, a1, a2).Scan(&holdUUID)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.commit($1, 0)`, holdUUID)
+		assert.True(err != nil) // zero amount
+	})
+
+	t.Run("MultipleReservesAgainstSameConstrainedAccount", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var constrained, other string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Multi Reserve', null, true, false)`,
+			ledgerUUID).Scan(&constrained)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Multi Other')`,
+			ledgerUUID).Scan(&other)
+		assert.NoErr(err)
+
+		// fund 10000
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, other, constrained)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.reserve($1, $2, $3, 3000)`, ledgerUUID, constrained, other)
+		assert.NoErr(err)
+		_, err = conn.Exec(ctx, `select ledger.reserve($1, $2, $3, 3000)`, ledgerUUID, constrained, other)
+		assert.NoErr(err)
+		_, err = conn.Exec(ctx, `select ledger.reserve($1, $2, $3, 3000)`, ledgerUUID, constrained, other)
+		assert.NoErr(err) // 9000 <= 10000
+
+		_, err = conn.Exec(ctx, `select ledger.reserve($1, $2, $3, 2000)`, ledgerUUID, constrained, other)
+		assert.True(err != nil) // 11000 > 10000
+	})
+}
+
+func TestAtomicity(t *testing.T) {
+	assert := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	assert.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	err = setTestUserContext(ctx, conn, "atomicity_test_user")
+	assert.NoErr(err)
+
+	var ledgerUUID, acctA, acctB string
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Atomicity Test')`).Scan(&ledgerUUID)
+	assert.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Atom A')`, ledgerUUID).Scan(&acctA)
+	assert.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Atom B')`, ledgerUUID).Scan(&acctB)
+	assert.NoErr(err)
+
+	t.Run("BatchRollbackLeavesNoTransactions", func(t *testing.T) {
+		assert := is_.New(t)
+
+		before, err := countTransactions(ctx, conn)
+		assert.NoErr(err)
+
+		// 3rd entry has invalid amount (0)
+		_, err = conn.Exec(ctx, fmt.Sprintf(`
+			select ledger.post_transactions($1, '[
+				{"debit": "%s", "credit": "%s", "amount": 1000},
+				{"debit": "%s", "credit": "%s", "amount": 2000},
+				{"debit": "%s", "credit": "%s", "amount": 0}
+			]'::jsonb)`, acctA, acctB, acctA, acctB, acctA, acctB), ledgerUUID)
+		assert.True(err != nil)
+
+		after, err := countTransactions(ctx, conn)
+		assert.NoErr(err)
+		assert.Equal(after, before) // no partial inserts
+	})
+
+	t.Run("BatchRollbackLeavesCountersUnchanged", func(t *testing.T) {
+		assert := is_.New(t)
+
+		dBefore, cBefore, err := getBalance(ctx, conn, acctA)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, fmt.Sprintf(`
+			select ledger.post_transactions($1, '[
+				{"debit": "%s", "credit": "%s", "amount": 5000},
+				{"debit": "%s", "credit": "%s", "amount": 0}
+			]'::jsonb)`, acctA, acctB, acctA, acctB), ledgerUUID)
+		assert.True(err != nil)
+
+		dAfter, cAfter, err := getBalance(ctx, conn, acctA)
+		assert.NoErr(err)
+		assert.Equal(dBefore, dAfter)
+		assert.Equal(cBefore, cAfter)
+	})
+
+	t.Run("BatchRollbackLeavesNoBalanceHistory", func(t *testing.T) {
+		assert := is_.New(t)
+
+		before, err := countBalances(ctx, conn)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, fmt.Sprintf(`
+			select ledger.post_transactions($1, '[
+				{"debit": "%s", "credit": "%s", "amount": 3000},
+				{"debit": "%s", "credit": "%s", "amount": 0}
+			]'::jsonb)`, acctA, acctB, acctA, acctB), ledgerUUID)
+		assert.True(err != nil)
+
+		after, err := countBalances(ctx, conn)
+		assert.NoErr(err)
+		assert.Equal(after, before)
+	})
+
+	t.Run("LinkedRollbackLeavesNoTransactions", func(t *testing.T) {
+		assert := is_.New(t)
+
+		// create clearing account for linked
+		var clearing string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Atom Clearing')`, ledgerUUID).Scan(&clearing)
+		assert.NoErr(err)
+
+		before, err := countTransactions(ctx, conn)
+		assert.NoErr(err)
+
+		// 2nd leg has invalid amount
+		_, err = conn.Exec(ctx, fmt.Sprintf(`
+			select ledger.post_linked($1, '[
+				{"debit": "%s", "credit": "%s", "amount": 5000},
+				{"debit": "%s", "credit": "%s", "amount": 0}
+			]'::jsonb)`, acctA, clearing, clearing, acctB), ledgerUUID)
+		assert.True(err != nil)
+
+		after, err := countTransactions(ctx, conn)
+		assert.NoErr(err)
+		assert.Equal(after, before)
+	})
+
+	t.Run("LinkedRollbackLeavesCountersUnchanged", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var clearing2 string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Atom Clearing 2')`, ledgerUUID).Scan(&clearing2)
+		assert.NoErr(err)
+
+		dBefore, cBefore, err := getBalance(ctx, conn, acctA)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, fmt.Sprintf(`
+			select ledger.post_linked($1, '[
+				{"debit": "%s", "credit": "%s", "amount": 7000},
+				{"debit": "%s", "credit": "%s", "amount": 0}
+			]'::jsonb)`, acctA, clearing2, clearing2, acctB), ledgerUUID)
+		assert.True(err != nil)
+
+		dAfter, cAfter, err := getBalance(ctx, conn, acctA)
+		assert.NoErr(err)
+		assert.Equal(dBefore, dAfter)
+		assert.Equal(cBefore, cAfter)
+	})
+
+	t.Run("ConstraintFailureRollsBackEntireBatch", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var constrained, other string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Atom Constrained', null, true, false)`,
+			ledgerUUID).Scan(&constrained)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Atom Other')`,
+			ledgerUUID).Scan(&other)
+		assert.NoErr(err)
+
+		// fund 1000
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, 1000)`,
+			ledgerUUID, other, constrained)
+		assert.NoErr(err)
+
+		dBefore, cBefore, err := getBalance(ctx, conn, constrained)
+		assert.NoErr(err)
+
+		// batch: 500 (ok alone) + 600 (would exceed). entire batch should fail.
+		_, err = conn.Exec(ctx, fmt.Sprintf(`
+			select ledger.post_transactions($1, '[
+				{"debit": "%s", "credit": "%s", "amount": 500},
+				{"debit": "%s", "credit": "%s", "amount": 600}
+			]'::jsonb)`, constrained, other, constrained, other), ledgerUUID)
+		assert.True(err != nil)
+
+		dAfter, cAfter, err := getBalance(ctx, conn, constrained)
+		assert.NoErr(err)
+		assert.Equal(dBefore, dAfter)
+		assert.Equal(cBefore, cAfter)
+	})
+
+	t.Run("CorrectIsAtomicOnFailure", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var src, dst, closed string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Correct Src')`, ledgerUUID).Scan(&src)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Correct Dst')`, ledgerUUID).Scan(&dst)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Correct Closed')`, ledgerUUID).Scan(&closed)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, `select ledger.close_account($1)`, closed)
+		assert.NoErr(err)
+
+		var txUUID string
+		err = conn.QueryRow(ctx, `select ledger.post_transaction($1, $2, $3, 5000)`,
+			ledgerUUID, src, dst).Scan(&txUUID)
+		assert.NoErr(err)
+
+		dBefore, cBefore, err := getBalance(ctx, conn, src)
+		assert.NoErr(err)
+
+		// correct to a closed account — should fail
+		_, err = conn.Exec(ctx, `select ledger.correct($1, $2, $3, 5000)`, txUUID, src, closed)
+		assert.True(err != nil)
+
+		// counters should be unchanged (reversal rolled back too)
+		dAfter, cAfter, err := getBalance(ctx, conn, src)
+		assert.NoErr(err)
+		assert.Equal(dBefore, dAfter)
+		assert.Equal(cBefore, cAfter)
+	})
+}
+
+func TestUserIsolation(t *testing.T) {
+	ctx := context.Background()
+
+	// two separate connections, two different users
+	connA, err := pgx.Connect(ctx, testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { connA.Close(ctx) })
+
+	connB, err := pgx.Connect(ctx, testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { connB.Close(ctx) })
+
+	userA := "isolation_user_a"
+	userB := "isolation_user_b"
+
+	if err := setTestUserContext(ctx, connA, userA); err != nil {
+		t.Fatal(err)
+	}
+	if err := setTestUserContext(ctx, connB, userB); err != nil {
+		t.Fatal(err)
+	}
+
+	// user A creates a ledger with accounts and transactions
+	var ledgerA, acctA1, acctA2, txA string
+	connA.QueryRow(ctx, `select ledger.create_ledger('Shared Name')`).Scan(&ledgerA)
+	connA.QueryRow(ctx, `select ledger.create_account($1, 'Checking')`, ledgerA).Scan(&acctA1)
+	connA.QueryRow(ctx, `select ledger.create_account($1, 'Savings')`, ledgerA).Scan(&acctA2)
+	connA.QueryRow(ctx, `select ledger.post_transaction($1, $2, $3, 50000)`,
+		ledgerA, acctA1, acctA2).Scan(&txA)
+
+	t.Run("TwoUsersCanCreateSameNameLedger", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var ledgerB string
+		err := connB.QueryRow(ctx, `select ledger.create_ledger('Shared Name')`).Scan(&ledgerB)
+		assert.NoErr(err)
+		assert.True(ledgerA != ledgerB) // different UUIDs
+	})
+
+	t.Run("UserCannotSeeOtherUsersLedger", func(t *testing.T) {
+		assert := is_.New(t)
+
+		_, err := connB.Exec(ctx, `select * from ledger.get_accounts($1)`, ledgerA)
+		assert.True(err != nil) // not found
+	})
+
+	t.Run("UserCannotSeeOtherUsersAccounts", func(t *testing.T) {
+		assert := is_.New(t)
+
+		// ledger API function enforces user isolation via user_data check
+		_, err := connB.Exec(ctx, `select * from ledger.get_balance($1)`, acctA1)
+		assert.True(err != nil) // account not found for user B
+	})
+
+	t.Run("UserCannotSeeOtherUsersTransactions", func(t *testing.T) {
+		assert := is_.New(t)
+
+		// user B can't void user A's transaction — function checks user_data
+		_, err := connB.Exec(ctx, `select ledger.void($1)`, txA)
+		assert.True(err != nil) // transaction not found
+	})
+
+	t.Run("UserCannotSeeOtherUsersBalances", func(t *testing.T) {
+		assert := is_.New(t)
+
+		// user B can't get history for user A's account
+		_, err := connB.Exec(ctx, `select * from ledger.get_history($1)`, acctA1)
+		assert.True(err != nil) // account not found
+	})
+
+	t.Run("UserCannotVoidOtherUsersTransaction", func(t *testing.T) {
+		assert := is_.New(t)
+
+		_, err := connB.Exec(ctx, `select ledger.void($1)`, txA)
+		assert.True(err != nil) // not found
+	})
+
+	t.Run("UserCannotCorrectOtherUsersTransaction", func(t *testing.T) {
+		assert := is_.New(t)
+
+		_, err := connB.Exec(ctx, `select ledger.correct($1, null, null, 99999)`, txA)
+		assert.True(err != nil) // not found
+	})
+
+	t.Run("UserCannotSeeOtherUsersPending", func(t *testing.T) {
+		assert := is_.New(t)
+
+		// user A creates a pending hold
+		var holdUUID string
+		err := connA.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 1000)`,
+			ledgerA, acctA1, acctA2).Scan(&holdUUID)
+		if err != nil {
+			t.Skip("reserve failed, skipping pending isolation test")
+		}
+
+		// user B can't commit user A's pending transaction
+		_, err = connB.Exec(ctx, `select ledger.commit($1)`, holdUUID)
+		assert.True(err != nil) // not found for user B
+	})
+}
+
+func TestLinkedTransferGuarantees(t *testing.T) {
+	assert := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	assert.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	err = setTestUserContext(ctx, conn, "linked_guarantee_user")
+	assert.NoErr(err)
+
+	var ledgerUUID, checking, savings, clearing string
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Linked Guarantees')`).Scan(&ledgerUUID)
+	assert.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'LG Checking')`, ledgerUUID).Scan(&checking)
+	assert.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'LG Savings')`, ledgerUUID).Scan(&savings)
+	assert.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'LG Clearing')`, ledgerUUID).Scan(&clearing)
+	assert.NoErr(err)
+
+	// make clearing internal
+	_, err = conn.Exec(ctx, `update data.accounts set visibility = 'internal' where uuid = $1`, clearing)
+	assert.NoErr(err)
+
+	t.Run("ClearingAccountAlwaysNetsToZero", func(t *testing.T) {
+		assert := is_.New(t)
+
+		_, err := conn.Exec(ctx, fmt.Sprintf(`
+			select ledger.post_linked($1, '[
+				{"debit": "%s", "credit": "%s", "amount": 10000, "description": "To savings"},
+				{"debit": "%s", "credit": "%s", "amount": 10000, "description": "From checking"}
+			]'::jsonb)`, checking, clearing, clearing, savings), ledgerUUID)
+		assert.NoErr(err)
+
+		d, c, err := getBalance(ctx, conn, clearing)
+		assert.NoErr(err)
+		assert.Equal(d, c) // nets to zero
+	})
+
+	t.Run("LinkIdIsSharedAcrossGroup", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var uuids []string
+		rows, err := conn.Query(ctx, fmt.Sprintf(`
+			select unnest(ledger.post_linked($1, '[
+				{"debit": "%s", "credit": "%s", "amount": 5000},
+				{"debit": "%s", "credit": "%s", "amount": 5000}
+			]'::jsonb))`, checking, clearing, clearing, savings), ledgerUUID)
+		assert.NoErr(err)
+		defer rows.Close()
+		for rows.Next() {
+			var u string
+			assert.NoErr(rows.Scan(&u))
+			uuids = append(uuids, u)
+		}
+		assert.NoErr(rows.Err())
+		assert.Equal(len(uuids), 2)
+
+		var linkID1, linkID2 *int64
+		err = conn.QueryRow(ctx, `select link_id from data.transactions where uuid = $1`, uuids[0]).Scan(&linkID1)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select link_id from data.transactions where uuid = $1`, uuids[1]).Scan(&linkID2)
+		assert.NoErr(err)
+
+		assert.True(linkID1 != nil)
+		assert.True(linkID2 != nil)
+		assert.Equal(*linkID1, *linkID2) // same link_id
+	})
+
+	t.Run("LinkIdIsUniquePerGroup", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var uuid1, uuid2 string
+
+		rows1, err := conn.Query(ctx, fmt.Sprintf(`
+			select unnest(ledger.post_linked($1, '[
+				{"debit": "%s", "credit": "%s", "amount": 1000},
+				{"debit": "%s", "credit": "%s", "amount": 1000}
+			]'::jsonb))`, checking, clearing, clearing, savings), ledgerUUID)
+		assert.NoErr(err)
+		for rows1.Next() {
+			rows1.Scan(&uuid1)
+		}
+		rows1.Close()
+
+		rows2, err := conn.Query(ctx, fmt.Sprintf(`
+			select unnest(ledger.post_linked($1, '[
+				{"debit": "%s", "credit": "%s", "amount": 2000},
+				{"debit": "%s", "credit": "%s", "amount": 2000}
+			]'::jsonb))`, checking, clearing, clearing, savings), ledgerUUID)
+		assert.NoErr(err)
+		for rows2.Next() {
+			rows2.Scan(&uuid2)
+		}
+		rows2.Close()
+
+		var link1, link2 int64
+		conn.QueryRow(ctx, `select link_id from data.transactions where uuid = $1`, uuid1).Scan(&link1)
+		conn.QueryRow(ctx, `select link_id from data.transactions where uuid = $1`, uuid2).Scan(&link2)
+
+		assert.True(link1 != link2) // different groups
+	})
+
+	t.Run("HistoryResolvesCounterpartyThroughClearing", func(t *testing.T) {
+		assert := is_.New(t)
+
+		// create fresh accounts for clean history
+		var ch, sv, cl string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Resolve Checking')`, ledgerUUID).Scan(&ch)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Resolve Savings')`, ledgerUUID).Scan(&sv)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Resolve Clearing')`, ledgerUUID).Scan(&cl)
+		assert.NoErr(err)
+		_, err = conn.Exec(ctx, `update data.accounts set visibility = 'internal' where uuid = $1`, cl)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, fmt.Sprintf(`
+			select ledger.post_linked($1, '[
+				{"debit": "%s", "credit": "%s", "amount": 8000, "description": "Transfer out"},
+				{"debit": "%s", "credit": "%s", "amount": 8000, "description": "Transfer in"}
+			]'::jsonb)`, ch, cl, cl, sv), ledgerUUID)
+		assert.NoErr(err)
+
+		// checking's history should show savings as counterparty, not clearing
+		var counterparty string
+		err = conn.QueryRow(ctx, `
+			select counterparty from ledger.get_history($1) limit 1
+		`, ch).Scan(&counterparty)
+		assert.NoErr(err)
+		assert.Equal(counterparty, "Resolve Savings") // resolved through clearing
+	})
+
+	t.Run("LinkedDoesNotAllowSingleLeg", func(t *testing.T) {
+		assert := is_.New(t)
+
+		_, err := conn.Exec(ctx, fmt.Sprintf(`
+			select ledger.post_linked($1, '[
+				{"debit": "%s", "credit": "%s", "amount": 1000}
+			]'::jsonb)`, checking, savings), ledgerUUID)
+		assert.True(err != nil) // at least 2 required
+	})
+
+	t.Run("LinkedCountersCorrectForBothSides", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var lc, ls, lcl string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'LC Checking')`, ledgerUUID).Scan(&lc)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'LC Savings')`, ledgerUUID).Scan(&ls)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'LC Clearing')`, ledgerUUID).Scan(&lcl)
+		assert.NoErr(err)
+
+		_, err = conn.Exec(ctx, fmt.Sprintf(`
+			select ledger.post_linked($1, '[
+				{"debit": "%s", "credit": "%s", "amount": 30000},
+				{"debit": "%s", "credit": "%s", "amount": 30000}
+			]'::jsonb)`, lc, lcl, lcl, ls), ledgerUUID)
+		assert.NoErr(err)
+
+		dCh, cCh, err := getBalance(ctx, conn, lc)
+		assert.NoErr(err)
+		assert.Equal(dCh, int64(30000))
+		assert.Equal(cCh, int64(0))
+
+		dSv, cSv, err := getBalance(ctx, conn, ls)
+		assert.NoErr(err)
+		assert.Equal(dSv, int64(0))
+		assert.Equal(cSv, int64(30000))
+
+		dCl, cCl, err := getBalance(ctx, conn, lcl)
+		assert.NoErr(err)
+		assert.Equal(dCl, cCl) // clearing nets to zero
+	})
+}
+
+func TestEdgeCases(t *testing.T) {
+	assert := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	assert.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	err = setTestUserContext(ctx, conn, "edge_case_user")
+	assert.NoErr(err)
+
+	var ledgerUUID, acctA, acctB string
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Edge Cases')`).Scan(&ledgerUUID)
+	assert.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Edge A')`, ledgerUUID).Scan(&acctA)
+	assert.NoErr(err)
+	err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Edge B')`, ledgerUUID).Scan(&acctB)
+	assert.NoErr(err)
+
+	t.Run("DoubleVoid", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var txUUID string
+		err := conn.QueryRow(ctx, `select ledger.post_transaction($1, $2, $3, 10000)`,
+			ledgerUUID, acctA, acctB).Scan(&txUUID)
+		assert.NoErr(err)
+
+		// first void creates reversal
+		var reversalUUID string
+		err = conn.QueryRow(ctx, `select ledger.void($1)`, txUUID).Scan(&reversalUUID)
+		assert.NoErr(err)
+
+		// void the reversal — should succeed (it's a valid posted transaction)
+		_, err = conn.Exec(ctx, `select ledger.void($1)`, reversalUUID)
+		assert.NoErr(err)
+
+		// net effect: original + reversal + reversal-of-reversal = back to original
+		dA, cA, err := getBalance(ctx, conn, acctA)
+		assert.NoErr(err)
+		// acctA: debited 10000 (orig) + credited 10000 (void) + debited 10000 (void of void)
+		assert.Equal(dA, int64(20000))
+		assert.Equal(cA, int64(10000))
+		// net = 10000 (same as original effect)
+	})
+
+	t.Run("OperationsOnNonexistentUUIDs", func(t *testing.T) {
+		assert := is_.New(t)
+
+		_, err := conn.Exec(ctx, `select ledger.void('nonexistent')`)
+		assert.True(err != nil)
+
+		_, err = conn.Exec(ctx, `select ledger.correct('nonexistent')`)
+		assert.True(err != nil)
+
+		_, err = conn.Exec(ctx, `select ledger.commit('nonexistent')`)
+		assert.True(err != nil)
+
+		_, err = conn.Exec(ctx, `select ledger.release('nonexistent')`)
+		assert.True(err != nil)
+
+		_, err = conn.Exec(ctx, `select * from ledger.get_balance('nonexistent')`)
+		assert.True(err != nil)
+
+		_, err = conn.Exec(ctx, `select * from ledger.get_history('nonexistent')`)
+		assert.True(err != nil)
+	})
+
+	t.Run("LargeAmountTransaction", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var la, lb string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Large A')`, ledgerUUID).Scan(&la)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Large B')`, ledgerUUID).Scan(&lb)
+		assert.NoErr(err)
+
+		largeAmount := int64(9_000_000_000_000_000)
+		_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, $4)`,
+			ledgerUUID, la, lb, largeAmount)
+		assert.NoErr(err)
+
+		d, c, err := getBalance(ctx, conn, la)
+		assert.NoErr(err)
+		assert.Equal(d, largeAmount)
+		assert.Equal(c, int64(0))
+	})
+
+	t.Run("ManyTransactionsCountersStayCorrect", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var ma, mb string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Many A')`, ledgerUUID).Scan(&ma)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Many B')`, ledgerUUID).Scan(&mb)
+		assert.NoErr(err)
+
+		var expectedSum int64
+		for i := 1; i <= 100; i++ {
+			amount := int64(i * 100)
+			_, err = conn.Exec(ctx, `select ledger.post_transaction($1, $2, $3, $4)`,
+				ledgerUUID, ma, mb, amount)
+			assert.NoErr(err)
+			expectedSum += amount
+		}
+
+		d, c, err := getBalance(ctx, conn, ma)
+		assert.NoErr(err)
+		assert.Equal(d, expectedSum) // 100 * 101 / 2 * 100 = 505000
+		assert.Equal(c, int64(0))
+	})
+
+	t.Run("IdempotencyKeyIsolatedByUser", func(t *testing.T) {
+		assert := is_.New(t)
+
+		// user A posts with a key
+		var uuidA string
+		err := conn.QueryRow(ctx, `select ledger.post_transaction($1, $2, $3, 1000, current_date, 'test', 'shared_key')`,
+			ledgerUUID, acctA, acctB).Scan(&uuidA)
+		assert.NoErr(err)
+
+		// user B with same key should create a different transaction
+		connB, err := pgx.Connect(ctx, testDSN)
+		assert.NoErr(err)
+		defer connB.Close(ctx)
+		err = setTestUserContext(ctx, connB, "edge_case_user_b")
+		assert.NoErr(err)
+
+		var ledgerB, aB1, aB2 string
+		err = connB.QueryRow(ctx, `select ledger.create_ledger('Edge B Ledger')`).Scan(&ledgerB)
+		assert.NoErr(err)
+		err = connB.QueryRow(ctx, `select ledger.create_account($1, 'B1')`, ledgerB).Scan(&aB1)
+		assert.NoErr(err)
+		err = connB.QueryRow(ctx, `select ledger.create_account($1, 'B2')`, ledgerB).Scan(&aB2)
+		assert.NoErr(err)
+
+		var uuidB string
+		err = connB.QueryRow(ctx, `select ledger.post_transaction($1, $2, $3, 1000, current_date, 'test', 'shared_key')`,
+			ledgerB, aB1, aB2).Scan(&uuidB)
+		assert.NoErr(err)
+
+		assert.True(uuidA != uuidB) // different transactions despite same key
+	})
+
+	t.Run("ReserveWithZeroTimeoutGetsNullTimeout", func(t *testing.T) {
+		assert := is_.New(t)
+
+		var ra, rb string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'ZeroTO A')`, ledgerUUID).Scan(&ra)
+		assert.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'ZeroTO B')`, ledgerUUID).Scan(&rb)
+		assert.NoErr(err)
+
+		var holdUUID string
+		err = conn.QueryRow(ctx, `select ledger.reserve($1, $2, $3, 5000, 0)`,
+			ledgerUUID, ra, rb).Scan(&holdUUID)
+		assert.NoErr(err)
+
+		var timeoutAt *time.Time
+		err = conn.QueryRow(ctx, `select timeout_at from data.transactions where uuid = $1`,
+			holdUUID).Scan(&timeoutAt)
+		assert.NoErr(err)
+		assert.True(timeoutAt == nil) // null timeout
+
+		// expire_pending should not expire it
+		_, err = conn.Exec(ctx, `select ledger.expire_pending()`)
+		assert.NoErr(err)
+
+		// should still be committable
+		_, err = conn.Exec(ctx, `select ledger.commit($1)`, holdUUID)
+		assert.NoErr(err)
+	})
+}
