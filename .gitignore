@@ -199,3 +199,8 @@ nogit_docs
 .claude
 .context
 .agents
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
