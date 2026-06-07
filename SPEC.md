@@ -3,6 +3,13 @@
 ## Introduction
 This specification explains how to implement zero-sum budgeting (like YNAB) using double-entry accounting principles. Zero-sum budgeting means giving every dollar a job, where total income equals total allocated funds.
 
+> **Note on layering:** This document describes the *budgeting layer's*
+> conceptual model. In pgbudget the generic `ledger` engine is typeless —
+> accounts are just containers with debit/credit counters. The account
+> "types" and balance directions below (asset/liability/equity,
+> debit/credit normal balances) are meaning that the `budget` layer
+> assigns on top of the engine, not columns stored in the ledger itself.
+
 ## Account Types
 
 | Budget Concept | Accounting Type | Internal Behavior | Normal Balance |
@@ -64,7 +71,7 @@ Credit: Bank Account (Asset) -$75
 1. **Start Simple**: Begin with just three accounts: Bank Account, Income, and one Budget Category
 2. **Income is Equity**: Treat Income as unallocated equity rather than revenue
 3. **Categories are Equity**: Categories represent portions of your wealth you've assigned to specific purposes
-4. **Database Design**: Store both semantic type (asset, liability, equity) and behavioral type (asset-like, liability-like)
+4. **Database Design**: Keep account semantics (asset, liability, equity) and their balance direction in the budgeting layer — the generic ledger engine stores only raw debit/credit counters and assigns no type
 5. **Reports**: Budget reports show category balances; financial reports show actual account balances
 
 ## Rules to Remember

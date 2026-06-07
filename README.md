@@ -4,585 +4,219 @@
 
 # pgbudget
 
-A PostgreSQL-based zero-sum budgeting database engine that implements double-entry accounting principles for personal finance applications.
+A generic double-entry accounting engine in PostgreSQL, inspired by
+[TigerBeetle](https://tigerbeetle.com/), with a zero-sum budgeting layer
+built on top.
 
 ## What it is
 
-pgbudget provides a complete database foundation for zero-sum budgeting applications (similar to YNAB). It handles the complex accounting logic so you can focus on building user interfaces and application features.
+pgbudget is two things in one PostgreSQL database:
 
-The system implements proper double-entry accounting where every transaction affects two accounts, ensuring mathematical accuracy and providing a complete audit trail. Budget categories function as equity accounts that track your financial intentions, while asset and liability accounts track your actual money.
+1. **`ledger` schema**: a generic double-entry accounting engine.
+   Accounts have no type; they are just containers with debit/credit
+   counters and optional balance constraints. The engine moves numbers
+   between accounts and returns raw counters. It knows nothing about
+   budgeting.
+2. **`budget` schema**: a zero-sum budgeting application layer (similar
+   to YNAB) that translates budgeting vocabulary (income, expenses,
+   categories) into ledger operations. Planned, not yet built.
 
-## Features
+> **Status:** The ledger engine is complete and fully tested. The budget
+> layer is the next milestone.
 
-- **Complete budgeting workflow**: Create ledgers, accounts, categories, and transactions
-- **Category groups**: Organize categories into logical groups (Household, Transportation, etc.)
-- **Zero-sum budgeting**: Every dollar gets assigned a job through proper allocation
-- **Double-entry accounting**: All transactions maintain accounting equation balance
-- **Multi-tenant support**: Row-level security for multiple users
-- **Real-time balance calculations**: On-demand account balance computation
-- **Transaction history**: Complete audit trail with running balances
-- **Budget status reporting**: Track budgeted vs spent amounts per category
-- **Group-filtered reporting**: View budget totals filtered by category groups
-- **Error correction**: Functions to correct or delete transactions with audit trail
+## Design
+
+The ledger follows TigerBeetle's model rather than traditional
+application-coupled accounting:
+
+- **No account types.** Accounts are containers with `debits_total` and
+  `credits_total` counters. Whether an account is an "asset" or a
+  "liability" is the application layer's interpretation, not the
+  engine's.
+- **Raw counters, not signed balances.** `get_balance()` returns
+  `(debits_total, credits_total)`. The caller computes the signed
+  balance based on what it knows the account means (e.g.
+  `debits - credits` for assets, `credits - debits` for liabilities).
+- **Immutable transactions.** Rows are INSERT-only. Mistakes are fixed
+  by `void` and `correct`, which create reversing transactions, never by
+  UPDATE or DELETE.
+- **Multi-tenant by row-level security.** Every row carries a
+  `user_data` column; RLS isolates each tenant. What `user_data`
+  represents (a user, an org, a merchant) is the application's choice.
+- **Balance constraints.** Optional per-account constraints
+  (`debits_must_not_exceed_credits`, `credits_must_not_exceed_debits`),
+  enforced on the checked write path; pending holds count against them.
+- **Flexible posting.** Single and batch transaction posting, plus
+  linked multi-leg transfers through a caller-provided clearing account.
+- **Two-phase transfers.** `reserve` then `commit`/`release`, with
+  timeouts and partial commits.
+- **Idempotency.** Optional idempotency keys on transactions.
+- **Account lifecycle.** Permanent closing that rejects new activity but
+  allows unwinding existing state, plus `standard` vs `internal` account
+  visibility.
+- **App-defined `code` field.** A smallint on accounts and transactions
+  for categorization; the engine stores and indexes it but assigns no
+  meaning.
+- **Balance history.** Append-only history alongside atomic current
+  counters.
 
 ## Requirements
 
-- PostgreSQL 12 or higher
+- PostgreSQL 14 or higher
 - [Goose](https://github.com/pressly/goose) for database migrations
+- Docker, to run the test suite
 
 ## Setup
 
-1. Create a PostgreSQL database
+1. Create a PostgreSQL database.
 2. Run migrations:
 
 ```bash
 goose -dir migrations postgres "your-connection-string" up
 ```
 
-3. Set user context for each session:
+3. Set the tenant context at the start of each session:
 
 ```sql
-SELECT set_config('app.current_user_id', 'your_user_id', false);
+select set_config('app.current_user_id', 'your-tenant-id', false);
 ```
 
-## API Reference
+All RLS policies filter on `utils.get_user()`, which reads
+`app.current_user_id` (falling back to the database role if unset).
 
-All monetary amounts are stored as integers (cents). $10.00 = 1000 cents.
+## Amounts
 
-### Core Functions
+All monetary amounts are stored as `bigint` in the smallest currency
+unit (e.g. cents). $10.00 is `1000`.
 
-**Create a ledger (budget):**
+## Quick start
+
 ```sql
-INSERT INTO api.ledgers (name) VALUES ('My Budget') RETURNING uuid;
-```
+-- set the tenant context for this session
+select set_config('app.current_user_id', 'demo-user', false);
 
-Example output:
-```
-   uuid   
-----------
- d3pOOf6t
-```
+-- create a ledger
+select ledger.create_ledger('Personal') as ledger_uuid;  -- e.g. 'd3pOOf6t'
 
-**Create an account:**
-```sql
-INSERT INTO api.accounts (ledger_uuid, name, type)
-VALUES ('d3pOOf6t', 'Checking', 'asset') RETURNING uuid;
-```
+-- create two accounts in the ledger
+select ledger.create_account('d3pOOf6t', 'Checking') as checking_uuid; -- 'aK9sLp0Q'
+select ledger.create_account('d3pOOf6t', 'Rent')     as rent_uuid;     -- 'mN8xPqR3'
 
-Example output:
-```
-   uuid   
-----------
- aK9sLp0Q
-```
-
-**Create a budget category:**
-```sql
-SELECT uuid FROM api.add_category('d3pOOf6t', 'Groceries');
-```
-
-Example output:
-```
-   uuid   
-----------
- mN8xPqR3
-```
-
-**Add income:**
-```sql
-SELECT api.add_transaction(
-    'd3pOOf6t', NOW(), 'Paycheck', 'inflow', 100000,
-    'aK9sLp0Q', (SELECT uuid FROM api.accounts 
-                 WHERE ledger_uuid = 'd3pOOf6t' AND name = 'Income')
+-- post a transfer: debit Rent, credit Checking, $1,200
+select ledger.post_transaction(
+    'd3pOOf6t',          -- ledger
+    'mN8xPqR3',          -- debit account
+    'aK9sLp0Q',          -- credit account
+    120000,              -- amount in cents
+    current_date,        -- date
+    'April rent'         -- description
 );
+
+-- read raw counters; the app decides how to sign them
+select * from ledger.get_balance('aK9sLp0Q');
+--  debits_total | credits_total
+-- --------------+---------------
+--             0 |        120000
 ```
 
-Example output:
-```
- add_transaction 
------------------
- xY7zPqR2
-```
+## Ledger API
 
-**Assign money to category:**
-```sql
-SELECT uuid FROM api.assign_to_category(
-    'd3pOOf6t', NOW(), 'Budget: Groceries', 20000, 'mN8xPqR3'
-);
-```
+All amounts are `bigint` (smallest currency unit). Queries return raw
+counters, not signed balances.
 
-Example output:
-```
-   uuid   
-----------
- bK2tQw9L
-```
-
-**Record spending:**
-```sql
-SELECT api.add_transaction(
-    'd3pOOf6t', NOW(), 'Grocery shopping', 'outflow', 5000,
-    'aK9sLp0Q', 'mN8xPqR3'
-);
-```
-
-Example output:
-```
- add_transaction 
------------------
- cL3uRx8M
-```
-
-### Category Groups
-
-Organize your categories into logical groups for better budget management and reporting.
-
-**Create category groups:**
-```sql
--- Create groups with optional description and sort order
-SELECT api.add_group('d3pOOf6t', 'Household', 'Home and family expenses', 1);
-SELECT api.add_group('d3pOOf6t', 'Transportation', 'Car, gas, and travel', 2);
-SELECT api.add_group('d3pOOf6t', 'Savings Goals', 'Emergency fund and goals', 3);
-```
-
-Example output:
-```
- add_group 
------------
- hG8kLm2N
-```
-
-**View all groups:**
-```sql
-SELECT * FROM api.get_groups('d3pOOf6t') ORDER BY sort_order;
-```
-
-Example output:
-```
-   uuid   |     name       |       description        | sort_order |        created_at
-----------+----------------+--------------------------+------------+---------------------------
- hG8kLm2N | Household      | Home and family expenses |          1 | 2025-08-24 10:00:00+00
- tR5pQw9X | Transportation | Car, gas, and travel     |          2 | 2025-08-24 10:01:00+00
- sV7nUi4K | Savings Goals  | Emergency fund and goals |          3 | 2025-08-24 10:02:00+00
-```
-
-**Assign categories to groups:**
-```sql
--- Assign categories to groups
-SELECT api.assign_category_to_group('mN8xPqR3', 'hG8kLm2N'); -- Groceries → Household
-SELECT api.assign_category_to_group('pQ4vWx7N', 'hG8kLm2N'); -- Rent → Household
-SELECT api.assign_category_to_group('zK9sLp0Q', 'tR5pQw9X'); -- Gas → Transportation
-
--- Remove category from group (make it ungrouped)
-SELECT api.assign_category_to_group('rT8yUi2P', null); -- Entertainment → ungrouped
-```
-
-**Budget totals by group:**
-```sql
--- Get budget totals for a specific group
-SELECT * FROM api.get_budget_totals('d3pOOf6t', null, 'hG8kLm2N');
-```
-
-Example output:
-```
- income | income_remaining_from_last_month | budgeted | left_to_budget 
---------+----------------------------------+----------+----------------
-      0 |                                0 |   230000 |              0
-```
-
-*Note: When filtering by group, income-related fields show 0 since income is not attributed to specific groups. The `budgeted` amount shows total budgeted for categories in the Household group ($2,300).*
-
-**Delete a group:**
-```sql
-SELECT api.delete_group('hG8kLm2N');
-```
-
-*When a group is deleted, all categories in that group become ungrouped (group_id = null). Transaction history is preserved to maintain the immutable accounting principle.*
-
-### Reporting Functions
-
-**Budget status:**
-```sql
-SELECT * FROM api.get_budget_status('d3pOOf6t');
-```
-
-Example output:
-```
- category_uuid | category_name | budgeted | activity | balance 
----------------+---------------+----------+----------+---------
- r95bZcwu      | Groceries     |    40000 |    -8500 |   31500
- P6lNFJrD      | Rent          |   120000 |  -120000 |       0
- rqFGEd8I      | Utilities     |    15000 |    -7500 |    7500
-```
-
-**Budget status for specific month:**
-```sql
--- August 2025 budget activity
-SELECT * FROM api.get_budget_status('d3pOOf6t', '202508');
-
--- Current month budget activity
-SELECT * FROM api.get_budget_status('d3pOOf6t', TO_CHAR(CURRENT_DATE, 'YYYYMM'));
-```
-
-The period parameter format is `YYYYMM` (e.g., `202508` for August 2025). When provided, the function shows only budget assignments and spending that occurred within that month.
-
-Example output:
-```
- category_uuid | category_name | budgeted | activity | balance 
----------------+---------------+----------+----------+---------
- r95bZcwu      | Groceries     |    20000 |    -4250 |   15750
- P6lNFJrD      | Rent          |   120000 |  -120000 |       0
- rqFGEd8I      | Utilities     |     7500 |    -3750 |    3750
-```
-
-**Budget totals:**
-```sql
--- All categories (existing functionality)
-SELECT * FROM api.get_budget_totals('d3pOOf6t');
-
--- Specific group only
-SELECT * FROM api.get_budget_totals('d3pOOf6t', null, 'hG8kLm2N');
-
--- Month view with group filtering
-SELECT * FROM api.get_budget_totals('d3pOOf6t', '202508', 'tR5pQw9X');
-```
-
-Example output (all categories):
-```
- income | income_remaining_from_last_month | budgeted | left_to_budget 
---------+----------------------------------+----------+----------------
- 350000 |                                0 |   175000 |         175000
-```
-
-Example output (Household group):
-```
- income | income_remaining_from_last_month | budgeted | left_to_budget 
---------+----------------------------------+----------+----------------
-      0 |                                0 |   140000 |              0
-```
-
-**Budget totals for specific month:**
-```sql
-SELECT * FROM api.get_budget_totals('d3pOOf6t', '202508');
-```
-
-Example output:
-```
- income | income_remaining_from_last_month | budgeted | left_to_budget 
---------+----------------------------------+----------+----------------
- 175000 |                            87500 |    87500 |          87500
-```
-
-**Understanding budget totals:**
-- **income**: Total income received in the period (0 when filtering by group)
-- **income_remaining_from_last_month**: Income balance carried over from previous month (month view only, 0 for groups)
-- **budgeted**: Total amount assigned to categories in the period (or group)
-- **left_to_budget**: Current balance of Income account (0 when filtering by group)
-
-*Note: When filtering by group, income-related fields show 0 since income is not attributed to specific groups.*
-
-**Account balance:**
-```sql
-SELECT api.get_account_balance('aK9sLp0Q');
-```
-
-Example output:
-```
- get_account_balance 
----------------------
-               95000
-```
-
-**Transaction history:**
-```sql
-SELECT * FROM api.get_account_transactions('aK9sLp0Q');
-```
-
-Example output:
-```
-    date    |  category  |   description    |  type   | amount | running_balance 
-------------+------------+------------------+---------+--------+-----------------
- 2025-08-24 | Groceries  | Grocery shopping | outflow |   5000 |           95000
- 2025-08-24 | Income     | Paycheck         | inflow  | 100000 |          100000
-```
-
-**All account balances:**
-```sql
-SELECT * FROM api.get_ledger_balances('d3pOOf6t');
-```
-
-Example output:
-```
- account_uuid | account_name  | account_type | current_balance 
---------------+---------------+--------------+-----------------
- aK9sLp0Q     | Checking      | asset        |           95000
- pQ4vWx7N     | Income        | equity       |           72500
- mN8xPqR3     | Groceries     | equity       |           15000
- zKHL0bud     | Internet      | equity       |               0
- rT8yUi2P     | Off-budget    | equity       |               0
- sV9zOj3Q     | Unassigned    | equity       |               0
-```
-
-### Transaction Management
-
-**Correct a transaction:**
-```sql
-SELECT api.correct_transaction(
-    'cL3uRx8M', 'outflow', 'aK9sLp0Q', 'mN8xPqR3',
-    6000, 'Updated grocery shopping', NOW(), 'Amount correction'
-);
-```
-
-Example output:
-```
- correct_transaction 
----------------------
- dM4vSy9N
-```
-
-**Delete a transaction:**
-```sql
-SELECT api.delete_transaction('cL3uRx8M', 'Duplicate transaction');
-```
-
-Example output:
-```
- delete_transaction 
---------------------
- eN5wTz0O
-```
-
-## Default Accounts
-
-Each ledger automatically creates three special accounts:
-
-- **Income**: Holds unallocated funds until assigned to categories
-- **Off-budget**: For tracking transactions outside your budget
-- **Unassigned**: Default category for uncategorized transactions
-
-## Complete Budget Workflow with Groups
-
-Here's a realistic example of setting up a budget with category groups:
+### Setup
 
 ```sql
--- Set user context
-SELECT set_config('app.current_user_id', 'user123', false);
-
--- 1. Create a ledger
-INSERT INTO api.ledgers (name) VALUES ('Monthly Budget') RETURNING uuid;
--- Returns: 'd3pOOf6t'
-
--- 2. Create a checking account
-INSERT INTO api.accounts (ledger_uuid, name, type) 
-VALUES ('d3pOOf6t', 'Chase Checking', 'asset') RETURNING uuid;
--- Returns: 'aK9sLp0Q'
-
--- 3. Create category groups
-SELECT api.add_group('d3pOOf6t', 'Household', 'Home and family expenses', 1);
--- Returns: 'hG8kLm2N'
-SELECT api.add_group('d3pOOf6t', 'Transportation', 'Car and travel', 2);
--- Returns: 'tR5pQw9X'
-
--- 4. Create categories
-SELECT uuid FROM api.add_category('d3pOOf6t', 'Groceries');
--- Returns: 'mN8xPqR3'
-SELECT uuid FROM api.add_category('d3pOOf6t', 'Rent');
--- Returns: 'pQ4vWx7N'
-SELECT uuid FROM api.add_category('d3pOOf6t', 'Gas');
--- Returns: 'zK9sLp0Q'
-SELECT uuid FROM api.add_category('d3pOOf6t', 'Entertainment');
--- Returns: 'rT8yUi2P'
-
--- 5. Assign categories to groups
-SELECT api.assign_category_to_group('mN8xPqR3', 'hG8kLm2N'); -- Groceries → Household
-SELECT api.assign_category_to_group('pQ4vWx7N', 'hG8kLm2N'); -- Rent → Household
-SELECT api.assign_category_to_group('zK9sLp0Q', 'tR5pQw9X'); -- Gas → Transportation
--- Entertainment remains ungrouped
-
--- 6. Add monthly income
-SELECT api.add_transaction(
-    'd3pOOf6t', NOW(), 'Salary Deposit', 'inflow', 500000,
-    'aK9sLp0Q', (SELECT uuid FROM api.accounts 
-                 WHERE ledger_uuid = 'd3pOOf6t' AND name = 'Income')
-);
--- Returns: 'xY7zPqR2'
-
--- 7. Budget money to categories
-SELECT uuid FROM api.assign_to_category('d3pOOf6t', NOW(), 'Budget: Groceries', 60000, 'mN8xPqR3');
--- Returns: 'bK2tQw9L'
-SELECT uuid FROM api.assign_to_category('d3pOOf6t', NOW(), 'Budget: Rent', 150000, 'pQ4vWx7N');
--- Returns: 'cL3uRx8M'
-SELECT uuid FROM api.assign_to_category('d3pOOf6t', NOW(), 'Budget: Gas', 25000, 'zK9sLp0Q');
--- Returns: 'dM4vSy9N'
-SELECT uuid FROM api.assign_to_category('d3pOOf6t', NOW(), 'Budget: Entertainment', 15000, 'rT8yUi2P');
--- Returns: 'eN5wTz0O'
-
--- 8. Record some spending
-SELECT api.add_transaction(
-    'd3pOOf6t', NOW(), 'Whole Foods', 'outflow', 12000,
-    'aK9sLp0Q', 'mN8xPqR3'
-);
--- Returns: 'fO6xUa1P'
-
-SELECT api.add_transaction(
-    'd3pOOf6t', NOW(), 'Shell Gas Station', 'outflow', 8000,
-    'aK9sLp0Q', 'zK9sLp0Q'
-);
--- Returns: 'gP7yVb2Q'
-
--- 9. Check budget totals by group
-SELECT * FROM api.get_budget_totals('d3pOOf6t', null, 'hG8kLm2N'); -- Household group
--- Returns:
---  income | income_remaining_from_last_month | budgeted | left_to_budget 
--- --------+----------------------------------+----------+----------------
---       0 |                                0 |   210000 |              0
-
-SELECT * FROM api.get_budget_totals('d3pOOf6t', null, 'tR5pQw9X'); -- Transportation group  
--- Returns:
---  income | income_remaining_from_last_month | budgeted | left_to_budget 
--- --------+----------------------------------+----------+----------------
---       0 |                                0 |    25000 |              0
-
-SELECT * FROM api.get_budget_totals('d3pOOf6t'); -- All categories
--- Returns:
---  income | income_remaining_from_last_month | budgeted | left_to_budget 
--- --------+----------------------------------+----------+----------------
---  500000 |                                0 |   250000 |         250000
-
--- 10. Check budget status (shows spending activity)
-SELECT * FROM api.get_budget_status('d3pOOf6t');
--- Returns:
---  category_uuid | category_name | budgeted | activity | balance 
--- ---------------+---------------+----------+----------+---------
---  mN8xPqR3      | Groceries     |    60000 |   -12000 |   48000
---  pQ4vWx7N      | Rent          |   150000 |        0 |  150000
---  zK9sLp0Q      | Gas           |    25000 |    -8000 |   17000
---  rT8yUi2P      | Entertainment |    15000 |        0 |   15000
+ledger.create_ledger(name, description?)
+ledger.create_account(ledger, name, description?,
+    debits_must_not_exceed_credits?, credits_must_not_exceed_debits?, code?)
+ledger.close_account(account)         -- permanent; rejects new transactions
+ledger.delete_ledger(ledger)          -- CASCADE with cleanup
 ```
 
-## Example Workflow
+### Posting transactions
 
 ```sql
--- Set user context
-SELECT set_config('app.current_user_id', 'user123', false);
--- Returns: set_config
---          ------------
---          
-
--- Create budget
-INSERT INTO api.ledgers (name) VALUES ('Monthly Budget') RETURNING uuid;
--- Returns:
---    uuid   
--- ----------
---  d3pOOf6t
-
--- Create checking account
-INSERT INTO api.accounts (ledger_uuid, name, type)
-VALUES ('d3pOOf6t', 'Checking', 'asset') RETURNING uuid;
--- Returns:
---    uuid   
--- ----------
---  aK9sLp0Q
-
--- Create grocery category
-SELECT uuid FROM api.add_category('d3pOOf6t', 'Groceries');
--- Returns:
---    uuid   
--- ----------
---  mN8xPqR3
-
--- Add $1000 income
-SELECT api.add_transaction(
-    'd3pOOf6t', NOW(), 'Paycheck', 'inflow', 100000,
-    'aK9sLp0Q', (SELECT uuid FROM api.accounts 
-                 WHERE ledger_uuid = 'd3pOOf6t' AND name = 'Income')
-);
--- Returns:
---  add_transaction 
--- -----------------
---  xY7zPqR2
-
--- Assign $200 to groceries
-SELECT uuid FROM api.assign_to_category(
-    'd3pOOf6t', NOW(), 'Budget: Groceries', 20000, 'mN8xPqR3'
-);
--- Returns:
---    uuid   
--- ----------
---  bK2tQw9L
-
--- Spend $50 on groceries
-SELECT api.add_transaction(
-    'd3pOOf6t', NOW(), 'Grocery shopping', 'outflow', 5000,
-    'aK9sLp0Q', 'mN8xPqR3'
-);
--- Returns:
---  add_transaction 
--- -----------------
---  cL3uRx8M
-
--- Check budget status
-SELECT * FROM api.get_budget_status('d3pOOf6t');
--- Returns:
---  category_uuid | category_name | budgeted | activity | balance 
--- ---------------+---------------+----------+----------+---------
---  mN8xPqR3      | Groceries     |    20000 |    -5000 |   15000
---  pQ4vWx7N      | Income        |        0 |        0 |   80000
+ledger.post_transaction(ledger, debit, credit, amount,
+    date?, description?, idempotency_key?)
+ledger.post_transactions(ledger, jsonb_array)   -- batch, all-or-nothing
+ledger.post_linked(ledger, jsonb_array)         -- multi-leg via clearing account
 ```
 
-## Account Closing
-
-Accounts can be permanently closed with `ledger.close_account()`. A closed account rejects most new activity but allows unwinding existing state.
+### Two-phase transfers
 
 ```sql
-SELECT ledger.close_account('account_uuid');
+ledger.reserve(ledger, debit, credit, amount,
+    timeout_seconds?, date?, description?, idempotency_key?)
+ledger.commit(transaction, amount?)   -- partial commits supported
+ledger.release(transaction)           -- void a pending hold
+ledger.expire_pending()               -- clean up timed-out holds
 ```
 
-### What's allowed on a closed account
+### Corrections (immutable)
+
+```sql
+ledger.void(transaction, reason?)     -- full reversal; allowed on closed accounts
+ledger.correct(transaction, debit?, credit?, amount?, description?, date?, reason?)
+```
+
+### Queries
+
+```sql
+ledger.get_balance(account)                    -- (debits_total, credits_total)
+ledger.get_balances(ledger)                    -- per-account counters
+ledger.get_accounts(ledger, include_internal?) -- account list with visibility filter
+ledger.get_history(account)                    -- counters per transaction, resolves counterparty
+ledger.rebuild_balances(ledger)                -- data repair
+```
+
+## Account closing
+
+Accounts can be permanently closed with `ledger.close_account()`. A
+closed account rejects new activity but allows you to unwind existing
+state.
 
 | Operation | Allowed? | Why |
 |---|---|---|
 | `ledger.post_transaction()` | No | No new transactions |
-| `ledger.post_transactions()` | No | Batch rejected if any entry hits closed account |
+| `ledger.post_transactions()` | No | Batch rejected if any leg hits a closed account |
 | `ledger.reserve()` | No | No new holds |
 | `ledger.commit()` | No | Can't settle on a frozen account |
 | `ledger.release()` | **Yes** | Must be able to release pending holds |
 | `ledger.void()` | **Yes** | Must be able to reverse mistakes |
-| `ledger.correct()` | No | Creates a new transaction (reversal is allowed internally, but the corrected transaction is rejected) |
-| `ledger.get_balance()` | **Yes** | Read-only, always works |
-| `ledger.get_history()` | **Yes** | Read-only, always works |
+| `ledger.correct()` | No | The corrected transaction is a new transaction |
+| `ledger.get_balance()` | **Yes** | Read-only |
+| `ledger.get_history()` | **Yes** | Read-only |
 
-### Typical workflow
-
-```sql
--- 1. Release any pending holds first
-SELECT ledger.release('pending_tx_uuid');
-
--- 2. Void any incorrect transactions if needed
-SELECT ledger.void('mistake_tx_uuid', 'Closing account');
-
--- 3. Close the account
-SELECT ledger.close_account('account_uuid');
-
--- 4. Balance is still readable
-SELECT ledger.get_balance('account_uuid');
-```
-
-Closing is permanent — there is no reopen function. If you need the account again, create a new one.
+Closing is permanent; there is no reopen. If you need the account again,
+create a new one.
 
 ## Architecture
 
-The database uses a four-schema design:
+The database uses a layered schema design:
 
-- **`data`**: Tables, constraints, and RLS policies
-- **`utils`**: Internal helper functions (validation, write paths)
-- **`ledger`**: Generic double-entry accounting engine
-- **`budget`**: Budgeting application layer (planned)
+- **`data`**: tables, constraints, RLS policies, indexes
+- **`utils`**: internal helpers (tenant context, fast/checked write paths)
+- **`ledger`**: the generic double-entry engine (public API)
+- **`budget`**: the budgeting application layer (planned; will call
+  `ledger.*` internally)
 
-The `ledger` schema is a complete double-entry engine inspired by [TigerBeetle](https://tigerbeetle.com/). It handles accounts, transactions, balances, corrections, two-phase transfers, batch inserts, idempotency, balance constraints, and account closing. It knows nothing about budgeting — it just moves numbers between accounts.
+The `ledger` schema is the complete engine. The `budget` schema will sit
+on top, assigning meaning to accounts (asset, liability, equity),
+computing signed balances, and exposing budgeting vocabulary, all in
+terms of ledger operations.
 
-The `budget` schema (planned) will sit on top, translating budgeting vocabulary (income, expenses, categories) into ledger operations.
+## Testing
+
+Tests are Go integration tests that spin up a real PostgreSQL instance
+with testcontainers, so a running Docker daemon is required.
+
+```bash
+go test -v               # run all tests
+go test -v -run TestName # run a specific test
+```
 
 ## License
 
-Licensed under GNU Affero General Public License v3.0 (AGPL-3.0). See [LICENSE](LICENSE) for details.
+Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). See
+[LICENSE](LICENSE) for details.

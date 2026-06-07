@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Rearchitected into a generic double-entry engine.** The project is
+  now two layers: a generic `ledger` engine (TigerBeetle-inspired) and a
+  budgeting `budget` layer built on top. Budgeting vocabulary moves out
+  of the engine and into the (planned) budget layer.
+- **Removed the `api` schema and PostgREST-oriented design.** The public
+  surface is now the `ledger.*` functions.
+- **Removed account types.** Accounts have no `type`/`internal_type`
+  columns. Accounts are containers with `debits_total`/`credits_total`
+  counters; the application layer interprets them.
+- **Raw counters instead of signed balances.** `ledger.get_balance()`
+  returns `(debits_total, credits_total)`; callers compute signed
+  balances.
+- **No auto-created accounts.** `ledger.create_ledger()` creates only the
+  ledger row; the caller creates the accounts it needs (including any
+  clearing accounts for linked transfers).
+
+### Added
+- **Generic ledger engine (`ledger` schema).** Accounts, single and
+  batch transaction posting, linked multi-leg transfers via a clearing
+  account, two-phase transfers (`reserve`/`commit`/`release`/
+  `expire_pending`), immutable corrections (`void`/`correct`),
+  idempotency keys, account closing, account visibility, and balance
+  history with atomic current counters.
+- **Per-account balance constraints**
+  (`debits_must_not_exceed_credits`, `credits_must_not_exceed_debits`),
+  enforced on the checked write path; pending holds count against them.
+- **App-defined `code` field** (smallint) on accounts and transactions
+  for categorization. The engine stores and indexes it but assigns no
+  meaning.
+
+### Removed
+- The budgeting `api.*` functions (category groups, budget status/totals,
+  income/expense/assign helpers) pending reimplementation in the
+  `budget` layer.
+
 ## [0.4.0] - 2025-08-24
 
 ### Added
