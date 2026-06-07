@@ -3809,3 +3809,178 @@ func TestEdgeCases(t *testing.T) {
 		assert.NoErr(err)
 	})
 }
+
+func TestAccountAndTransactionCode(t *testing.T) {
+	is := is_.New(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, testDSN)
+	is.NoErr(err)
+	t.Cleanup(func() { conn.Close(ctx) })
+
+	err = setTestUserContext(ctx, conn, "code_field_user")
+	is.NoErr(err)
+
+	var ledgerUUID string
+	err = conn.QueryRow(ctx, `select ledger.create_ledger('Code Field Test')`).Scan(&ledgerUUID)
+	is.NoErr(err)
+
+	t.Run("AccountCodeDefaultsToZero", func(t *testing.T) {
+		is := is_.New(t)
+
+		// create account without p_code — should default to 0
+		var acctUUID string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Default-Code')`, ledgerUUID).Scan(&acctUUID)
+		is.NoErr(err)
+
+		var code int16
+		err = conn.QueryRow(ctx, `select code from data.accounts where uuid = $1`, acctUUID).Scan(&code)
+		is.NoErr(err)
+		is.Equal(code, int16(0))
+	})
+
+	t.Run("AccountCodeStoredAndReturned", func(t *testing.T) {
+		is := is_.New(t)
+
+		// create with explicit code via named param
+		var acctUUID string
+		err := conn.QueryRow(ctx, `
+			select ledger.create_account(
+				p_ledger_uuid := $1,
+				p_name := 'Tagged-Account',
+				p_code := 42::smallint
+			)
+		`, ledgerUUID).Scan(&acctUUID)
+		is.NoErr(err)
+
+		// stored on row
+		var code int16
+		err = conn.QueryRow(ctx, `select code from data.accounts where uuid = $1`, acctUUID).Scan(&code)
+		is.NoErr(err)
+		is.Equal(code, int16(42))
+
+		// returned by get_accounts
+		var retCode int16
+		err = conn.QueryRow(ctx, `
+			select code from ledger.get_accounts($1) where account_uuid = $2
+		`, ledgerUUID, acctUUID).Scan(&retCode)
+		is.NoErr(err)
+		is.Equal(retCode, int16(42))
+	})
+
+	t.Run("TransactionCodeDefaultsToZero", func(t *testing.T) {
+		is := is_.New(t)
+
+		var srcUUID, dstUUID string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Src-Zero')`, ledgerUUID).Scan(&srcUUID)
+		is.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Dst-Zero')`, ledgerUUID).Scan(&dstUUID)
+		is.NoErr(err)
+
+		// post without p_code
+		var txUUID string
+		err = conn.QueryRow(ctx, `
+			select ledger.post_transaction($1, $2, $3, 500, '2026-04-01', 'default code')
+		`, ledgerUUID, srcUUID, dstUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		var code int16
+		err = conn.QueryRow(ctx, `select code from data.transactions where uuid = $1`, txUUID).Scan(&code)
+		is.NoErr(err)
+		is.Equal(code, int16(0))
+	})
+
+	t.Run("TransactionCodeStored", func(t *testing.T) {
+		is := is_.New(t)
+
+		var srcUUID, dstUUID string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Src-Code')`, ledgerUUID).Scan(&srcUUID)
+		is.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Dst-Code')`, ledgerUUID).Scan(&dstUUID)
+		is.NoErr(err)
+
+		var txUUID string
+		err = conn.QueryRow(ctx, `
+			select ledger.post_transaction(
+				p_ledger_uuid := $1,
+				p_debit_account_uuid := $2,
+				p_credit_account_uuid := $3,
+				p_amount := 500,
+				p_code := 7::smallint
+			)
+		`, ledgerUUID, srcUUID, dstUUID).Scan(&txUUID)
+		is.NoErr(err)
+
+		var code int16
+		err = conn.QueryRow(ctx, `select code from data.transactions where uuid = $1`, txUUID).Scan(&code)
+		is.NoErr(err)
+		is.Equal(code, int16(7))
+	})
+
+	t.Run("CodeCanBeFilteredViaIndex", func(t *testing.T) {
+		is := is_.New(t)
+
+		// create several accounts with distinct codes
+		for _, tc := range []struct {
+			name string
+			code int16
+		}{
+			{"Filter-A", 100},
+			{"Filter-B", 100},
+			{"Filter-C", 200},
+		} {
+			_, err := conn.Exec(ctx, `
+				select ledger.create_account(
+					p_ledger_uuid := $1, p_name := $2, p_code := $3
+				)
+			`, ledgerUUID, tc.name, tc.code)
+			is.NoErr(err)
+		}
+
+		// filter by code
+		var count int
+		err := conn.QueryRow(ctx, `
+			select count(*) from data.accounts
+			where ledger_id = (select id from data.ledgers where uuid = $1)
+			  and code = 100
+		`, ledgerUUID).Scan(&count)
+		is.NoErr(err)
+		is.Equal(count, 2)
+	})
+
+	t.Run("IdempotencyIgnoresCodeOnRetry", func(t *testing.T) {
+		is := is_.New(t)
+
+		var srcUUID, dstUUID string
+		err := conn.QueryRow(ctx, `select ledger.create_account($1, 'Src-Idem')`, ledgerUUID).Scan(&srcUUID)
+		is.NoErr(err)
+		err = conn.QueryRow(ctx, `select ledger.create_account($1, 'Dst-Idem')`, ledgerUUID).Scan(&dstUUID)
+		is.NoErr(err)
+
+		// first post with code=11
+		var uuid1 string
+		err = conn.QueryRow(ctx, `
+			select ledger.post_transaction(
+				p_ledger_uuid := $1, p_debit_account_uuid := $2, p_credit_account_uuid := $3,
+				p_amount := 100, p_idempotency_key := 'code_key_1', p_code := 11::smallint
+			)
+		`, ledgerUUID, srcUUID, dstUUID).Scan(&uuid1)
+		is.NoErr(err)
+
+		// retry with different code — should return original uuid, original code preserved
+		var uuid2 string
+		err = conn.QueryRow(ctx, `
+			select ledger.post_transaction(
+				p_ledger_uuid := $1, p_debit_account_uuid := $2, p_credit_account_uuid := $3,
+				p_amount := 100, p_idempotency_key := 'code_key_1', p_code := 99::smallint
+			)
+		`, ledgerUUID, srcUUID, dstUUID).Scan(&uuid2)
+		is.NoErr(err)
+		is.Equal(uuid1, uuid2)
+
+		var stored int16
+		err = conn.QueryRow(ctx, `select code from data.transactions where uuid = $1`, uuid1).Scan(&stored)
+		is.NoErr(err)
+		is.Equal(stored, int16(11)) // original code preserved
+	})
+}
